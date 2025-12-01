@@ -894,9 +894,8 @@ def try_pyqt5():
                 arrow.remove()
             self.velocity_arrows = []
             
-            # Arrow scale factor (multiply delta to make arrows visible)
-            # 30 seconds of movement, scaled up for visibility
-            arrow_scale = 30.0
+            # Arrow scale factor for visibility
+            arrow_scale = 8.0  # Scale the arrow length for visibility
             
             for sat in satellites_visible:
                 theta = sat['theta']
@@ -907,19 +906,43 @@ def try_pyqt5():
                 if d_theta is None or d_r is None:
                     continue
                 
-                # Scale the arrow length
-                d_theta_scaled = d_theta * arrow_scale
-                d_r_scaled = d_r * arrow_scale
+                # Convert current position to Cartesian (in plot space)
+                x = r * np.sin(theta)
+                y = r * np.cos(theta)
                 
-                # Only draw arrow if there's meaningful movement
-                movement = np.sqrt(d_theta_scaled**2 + d_r_scaled**2)
-                if movement < 0.01:  # Skip if barely moving
+                # Calculate future position in polar
+                theta_future = theta + d_theta
+                r_future = r + d_r
+                
+                # Convert future position to Cartesian
+                x_future = r_future * np.sin(theta_future)
+                y_future = r_future * np.cos(theta_future)
+                
+                # Calculate velocity vector in Cartesian
+                dx = x_future - x
+                dy = y_future - y
+                
+                # Calculate arrow length and skip if too small
+                arrow_length = np.sqrt(dx**2 + dy**2)
+                if arrow_length < 0.001:
                     continue
                 
-                # Create arrow using annotate (works well with polar plots)
+                # Normalize and scale the arrow
+                dx_scaled = (dx / arrow_length) * arrow_scale
+                dy_scaled = (dy / arrow_length) * arrow_scale
+                
+                # Calculate arrow endpoint in Cartesian
+                x_end = x + dx_scaled
+                y_end = y + dy_scaled
+                
+                # Convert arrow endpoint back to polar
+                r_end = np.sqrt(x_end**2 + y_end**2)
+                theta_end = np.arctan2(x_end, y_end)  # Note: sin/cos swap for polar plot orientation
+                
+                # Create arrow using annotate
                 arrow = self.ax.annotate(
                     '',  # No text
-                    xy=(theta + d_theta_scaled, r + d_r_scaled),  # Arrow head
+                    xy=(theta_end, r_end),  # Arrow head
                     xytext=(theta, r),  # Arrow tail (satellite position)
                     arrowprops=dict(
                         arrowstyle='->,head_width=0.3,head_length=0.2',
