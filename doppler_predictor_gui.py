@@ -743,7 +743,7 @@ def try_pyqt5():
                         # Calculate future position (30 seconds ahead) for velocity arrow
                         from skyfield.api import utc
                         future_time = datetime.utcfromtimestamp(
-                            current_time_utc.timestamp() + 3.0
+                            current_time_utc.timestamp() + 1.0
                         ).replace(tzinfo=utc)
                         ts_time_future = predictor.ts.from_datetime(future_time)
                         
@@ -896,7 +896,7 @@ def try_pyqt5():
             
             # Arrow scale factor (multiply delta to make arrows visible)
             # 30 seconds of movement, scaled up for visibility
-            arrow_scale = 10.0
+            arrow_scale = 30.0
             
             for sat in satellites_visible:
                 theta = sat['theta']
@@ -1693,82 +1693,6 @@ def try_pyqt5():
     sys.exit(app.exec_())
 
 
-def try_terminal_ui():
-    """Fallback to a simple terminal-based menu."""
-    import matplotlib
-    matplotlib.use('macosx')  # Try native macOS backend
-    
-    from doppler_predictor2 import MultiSatellitePredictor
-    import os
-    
-    print("\n" + "="*60)
-    print("  Starlink Doppler Predictor - Terminal Interface")
-    print("="*60)
-    
-    # Default location
-    ue_location = {
-        'latitude': 47.6550,
-        'longitude': -122.3035,
-        'altitude': 60
-    }
-    
-    # Try to load TLE
-    tle_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'starlink.txt')
-    
-    if not os.path.exists(tle_path):
-        print("\nNo starlink.txt found. Downloading...")
-        try:
-            import requests
-            url = "https://celestrak.org/NORAD/elements/gp.php?GROUP=starlink&FORMAT=tle"
-            response = requests.get(url, timeout=30)
-            response.raise_for_status()
-            with open(tle_path, 'w') as f:
-                f.write(response.text)
-            print("Downloaded successfully!")
-        except Exception as e:
-            print(f"Download failed: {e}")
-            return
-    
-    with open(tle_path, 'r') as f:
-        tle_data = f.read()
-    
-    print("\nLoading satellites...")
-    predictor = MultiSatellitePredictor(tle_data, ue_location, num_satellites=1000)
-    
-    while True:
-        print("\n" + "-"*40)
-        print("Options:")
-        print("  1. Show Sky Map (real-time)")
-        print("  2. Show Spectrum")
-        print("  3. Change Location")
-        print("  4. Quit")
-        print("-"*40)
-        
-        choice = input("Enter choice (1-4): ").strip()
-        
-        if choice == '1':
-            print("\nStarting sky map... (close window to return)")
-            predictor.plot_sky_map_realtime(elevation_mask=10.0, update_interval=1000)
-        elif choice == '2':
-            print("\nGenerating spectrum...")
-            predictor.plot_combined_spectrum(duration_minutes=5, elevation_mask=10.0)
-        elif choice == '3':
-            try:
-                lat = float(input("Enter latitude (°N): "))
-                lon = float(input("Enter longitude (°E): "))
-                alt = float(input("Enter altitude (m): "))
-                ue_location = {'latitude': lat, 'longitude': lon, 'altitude': alt}
-                predictor = MultiSatellitePredictor(tle_data, ue_location, num_satellites=1000)
-                print("Location updated!")
-            except ValueError:
-                print("Invalid input!")
-        elif choice == '4':
-            print("Goodbye!")
-            break
-        else:
-            print("Invalid choice!")
-
-
 def main():
     """Main entry point - try different GUI backends."""
     print("Starting Doppler Predictor GUI...")
@@ -1784,7 +1708,6 @@ def main():
     
     # Fallback to terminal UI
     print("\nFalling back to terminal interface...")
-    try_terminal_ui()
 
 
 if __name__ == "__main__":
