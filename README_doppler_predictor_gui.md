@@ -122,3 +122,127 @@ If PyQt5 is unavailable, the application falls back to a terminal-based interfac
 
 - **CelesTrak**: https://celestrak.org/NORAD/elements/gp.php?GROUP=starlink&FORMAT=tle
 - Downloaded TLEs are saved to `starlink_downloaded.txt`
+
+## Architecture
+
+### High-Level Structure
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                         main()                              │
+│   Entry point - tries PyQt5, falls back to terminal UI     │
+└─────────────────────────────────────────────────────────────┘
+                              │
+              ┌───────────────┴───────────────┐
+              ▼                               ▼
+┌─────────────────────────┐     ┌─────────────────────────────┐
+│     try_pyqt5()         │     │    try_terminal_ui()        │
+│   (Primary GUI)         │     │   (Fallback CLI)            │
+└─────────────────────────┘     └─────────────────────────────┘
+```
+
+### Core Classes
+
+#### 1. `DopplerPredictor`
+Single satellite Doppler calculation engine.
+
+| Attribute | Description |
+|-----------|-------------|
+| `STARLINK_TX_FREQ` | 10.5 GHz reference frequency |
+| `SPEED_OF_LIGHT` | 299,792,458 m/s |
+| Uses **Skyfield** library | For SGP4 TLE propagation |
+
+**Key Method:**
+- `calculate_doppler_shift(obs_time)` → Returns Doppler shift in Hz based on range-rate between satellite and ground station
+
+#### 2. `MultiSatellitePredictor`
+Manages multiple `DopplerPredictor` instances.
+
+- Parses bulk TLE data (3-line format: name, line1, line2)
+- Creates a list of `DopplerPredictor` objects
+- Limits to `num_satellites` for performance
+
+#### 3. `DopplerPredictorGUI`
+Main PyQt5 `QMainWindow` application.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    DopplerPredictorGUI                          │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌──────────────────┐  ┌──────────────────────────────────────┐ │
+│  │  Control Panel   │  │       Visualization Panel            │ │
+│  │  (Left side)     │  │       (Right side)                   │ │
+│  │                  │  │                                      │ │
+│  │  • TLE loading   │  │  ┌────────────────────────────────┐  │ │
+│  │  • Location input│  │  │   Polar Plot (Sky Map)         │  │ │
+│  │  • Settings      │  │  │   - Satellite positions        │  │ │
+│  │  • Action buttons│  │  │   - Azimuth/Elevation grid     │  │ │
+│  │  • Statistics    │  │  └────────────────────────────────┘  │ │
+│  │                  │  │  ┌────────────────────────────────┐  │ │
+│  │                  │  │  │   Inset Map (Location)         │  │ │
+│  │                  │  │  │   - Uses Cartopy if available  │  │ │
+│  │                  │  │  └────────────────────────────────┘  │ │
+│  └──────────────────┘  └──────────────────────────────────────┘ │
+├─────────────────────────────────────────────────────────────────┤
+│                        Status Bar                               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Timer-Based Update System
+
+The app uses **three QTimers** for efficient real-time updates:
+
+| Timer | Interval | Purpose |
+|-------|----------|---------|
+| `self.timer` | ~100ms (configurable) | Update **visible** satellite positions |
+| `self.visibility_timer` | 10 seconds | Check if **hidden** satellites became visible |
+| `self.waterfall_timer` | ~5 seconds (configurable) | Update Doppler waterfall spectrogram |
+
+**Optimization Strategy:**
+- **Visible satellites** → Updated frequently (fast timer)
+- **Hidden satellites** → Checked less often (slow timer)
+- Satellites swap between `visible_predictors` and `hidden_predictors` lists
+
+### Data Flow
+
+```
+TLE File/Download
+       │
+       ▼
+┌──────────────────┐
+│ MultiSatellitePredictor │
+│  (parses TLEs)   │
+└────────┬─────────┘
+         │ creates
+         ▼
+┌──────────────────┐
+│ DopplerPredictor │ ×N satellites
+│  (per satellite) │
+└────────┬─────────┘
+         │ calculates
+         ▼
+┌──────────────────────────────────┐
+│  Satellite Position & Doppler   │
+│  - Azimuth/Elevation            │
+│  - Doppler shift (Hz)           │
+│  - Slant distance               │
+└────────┬─────────────────────────┘
+         │ displays
+         ▼
+┌──────────────────────────────────┐
+│  Matplotlib Visualizations      │
+│  - Polar sky map                │
+│  - Waterfall spectrogram        │
+└──────────────────────────────────┘
+```
+
+### Key Features Summary
+
+| Feature | Implementation |
+|---------|----------------|
+| **Sky Map** | Polar plot showing satellite positions (az/el) |
+| **Live Waterfall** | Spectrogram of received frequency vs time |
+| **FSPL Calculation** | Free Space Path Loss in dB |
+| **Location Inset** | Mini-map with Cartopy (optional) |
+| **TLE Download** | From CelesTrak API |
+| **Threaded Downloads** | Non-blocking TLE fetch |
