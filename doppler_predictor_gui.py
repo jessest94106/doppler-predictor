@@ -32,7 +32,7 @@ class DopplerPredictor:
     RX_BAND_START = 10e9  # Hz (10 GHz - UE receive band start)
     RX_BAND_END = 11e9  # Hz (11 GHz - UE receive band end)
     
-    def __init__(self, tle_line1: str, tle_line2: str, ue_location: dict):
+    def __init__(self, tle_line1: str, tle_line2: str, ue_location: dict, tx_freq_hz: float = None):
         """
         Initialize the Doppler predictor.
         
@@ -40,9 +40,14 @@ class DopplerPredictor:
             tle_line1: First line of TLE data
             tle_line2: Second line of TLE data
             ue_location: Dict with keys 'latitude' (deg), 'longitude' (deg), 'altitude' (m)
+            tx_freq_hz: Transmit frequency in Hz (default: 10.5 GHz)
         """
         self.tle_line1 = tle_line1
         self.tle_line2 = tle_line2
+        
+        # Set TX frequency (use provided value or default)
+        if tx_freq_hz is not None:
+            self.STARLINK_TX_FREQ = tx_freq_hz
         
         # Parse TLE to extract satellite name
         self.sat_name = tle_line1.strip()
@@ -135,7 +140,7 @@ class MultiSatellitePredictor:
     Predicts combined Doppler spectrum from multiple Starlink satellites.
     """
     
-    def __init__(self, tle_data: str, ue_location: dict, num_satellites: int = 20):
+    def __init__(self, tle_data: str, ue_location: dict, num_satellites: int = 20, tx_freq_hz: float = None):
         """
         Initialize with multiple satellite TLEs.
         
@@ -143,8 +148,10 @@ class MultiSatellitePredictor:
             tle_data: TLE data string from CelesTrak (multiple 3-line TLE sets)
             ue_location: Dict with keys 'latitude', 'longitude', 'altitude'
             num_satellites: Number of satellites to use from TLE data
+            tx_freq_hz: Transmit frequency in Hz (default: 10.5 GHz)
         """
         self.ue_location = ue_location
+        self.tx_freq_hz = tx_freq_hz
         self.predictors = []
         
         # Parse TLE data into groups of 3 lines
@@ -161,7 +168,7 @@ class MultiSatellitePredictor:
             # Validate TLE format
             if tle_line1.startswith('1 ') and tle_line2.startswith('2 '):
                 try:
-                    predictor = DopplerPredictor(tle_line1, tle_line2, ue_location)
+                    predictor = DopplerPredictor(tle_line1, tle_line2, ue_location, tx_freq_hz=self.tx_freq_hz)
                     if predictor.skyfield:
                         self.predictors.append(predictor)
                         sat_count += 1
@@ -206,17 +213,30 @@ def try_pyqt5():
             self.timer = None
             self.visibility_timer = None  # Slower timer for checking visibility of out-of-view satellites
             self.waterfall_timer = None   # Timer for waterfall animation
+            self.single_sat_waterfall_timer = None  # Timer for single satellite waterfall
             self.tle_data = None
             self.is_running = False
             self.waterfall_running = False
+            self.single_sat_waterfall_running = False
             
             # Track which satellites are currently visible (for efficient updates)
             self.visible_predictors = []  # Satellites currently in view (updated frequently)
             self.hidden_predictors = []   # Satellites not in view (checked less often)
+            self.visible_sat_data = []    # Store satellite data for click detection
+            
+            # Selected satellite for individual waterfall
+            self.selected_predictor = None
+            self.selected_sat_name = None
             
             # Waterfall data storage
             self.waterfall_data = None
             self.waterfall_times = None
+            
+            # Single satellite waterfall data
+            self.single_sat_waterfall_data = None
+            
+            # Velocity arrows storage
+            self.velocity_arrows = []
             
             self.setup_ui()
             self.auto_load_tle()
@@ -280,12 +300,15 @@ def try_pyqt5():
             settings_group = QGroupBox("Settings")
             settings_layout = QFormLayout(settings_group)
             
+            self.carrier_freq_input = QLineEdit("10.5")
+            self.carrier_freq_input.setToolTip("Carrier/TX frequency in GHz (e.g., 10.5 for Starlink Ku-band, 12.0 for Ku-band DL)")
             self.elev_input = QLineEdit("10.0")
             self.num_sats_input = QLineEdit("1000")
             self.interval_input = QLineEdit("100")
             self.duration_input = QLineEdit("5")
             self.wf_update_input = QLineEdit("5")
             
+            settings_layout.addRow("Carrier Freq (GHz):", self.carrier_freq_input)
             settings_layout.addRow("Elevation Mask (°):", self.elev_input)
             settings_layout.addRow("Max Satellites:", self.num_sats_input)
             settings_layout.addRow("Sky Map Update (ms):", self.interval_input)
@@ -365,6 +388,9 @@ def try_pyqt5():
             # Canvas
             self.canvas = FigureCanvas(self.fig)
             layout.addWidget(self.canvas)
+            
+            # Connect click event for satellite selection
+            self.canvas.mpl_connect('pick_event', self.on_satellite_click)
             
             # Toolbar
             self.toolbar = NavigationToolbar(self.canvas, panel)
@@ -475,10 +501,15 @@ def try_pyqt5():
             self.ax.plot(0, 0, 'r+', markersize=15, markeredgewidth=3, label='Zenith (UE location)', zorder=10)
             self.ax.scatter([0], [0], c='red', s=100, marker='o', alpha=0.3, zorder=9)
             
-            # Initialize empty scatter plots
+            # Initialize empty scatter plots (picker=True enables click detection)
             self.satellite_glow = self.ax.scatter([], [], c='yellow', s=150, marker='o', alpha=0.3, zorder=4)
             self.satellite_scatter = self.ax.scatter([], [], c='white', s=50, marker='o', zorder=5,
-                                                      edgecolors='red', linewidths=0.5, label='Starlink Satellites')
+                                                      edgecolors='red', linewidths=0.5, label='Starlink Satellites',
+                                                      picker=True, pickradius=10)
+            
+            # Selected satellite marker (initially hidden)
+            self.selected_marker = self.ax.scatter([], [], c='lime', s=200, marker='*', zorder=6,
+                                                   edgecolors='white', linewidths=1.5, label='Selected')
             
             # Set up axes - center is 90° elevation (zenith), edge is 0° elevation (horizon)
             # r = 90 - elevation, so r=0 means 90° elev (center), r=90 means 0° elev (edge)
@@ -584,11 +615,19 @@ def try_pyqt5():
                 
                 num_sats = int(self.num_sats_input.text())
                 
+                # Get carrier frequency in Hz (input is in GHz)
+                carrier_freq_ghz = float(self.carrier_freq_input.text())
+                carrier_freq_hz = carrier_freq_ghz * 1e9
+                
                 self.status_bar.showMessage("Initializing predictor...")
                 
-                self.multi_predictor = MultiSatellitePredictor(self.tle_data, ue_location, num_satellites=num_sats)
+                self.multi_predictor = MultiSatellitePredictor(
+                    self.tle_data, ue_location, 
+                    num_satellites=num_sats, 
+                    tx_freq_hz=carrier_freq_hz
+                )
                 
-                self.status_bar.showMessage(f"Ready. {len(self.multi_predictor.predictors)} satellites loaded.")
+                self.status_bar.showMessage(f"Ready. {len(self.multi_predictor.predictors)} satellites loaded @ {carrier_freq_ghz} GHz.")
                 self.sats_label.setText(f"Loaded: {len(self.multi_predictor.predictors)}")
                 
                 # Update the location inset map
@@ -663,8 +702,13 @@ def try_pyqt5():
             """Update the sky map - DEPRECATED, kept for compatibility."""
             self.update_visible_satellites()
         
-        def calculate_satellite_position(self, predictor, current_time_utc, elevation_mask):
-            """Calculate position for a single satellite. Returns (is_visible, theta, r) or (False, None, None)."""
+        def calculate_satellite_position(self, predictor, current_time_utc, elevation_mask, calc_velocity=False):
+            """Calculate position for a single satellite.
+            
+            Returns:
+                If calc_velocity=False: (is_visible, theta, r) or (False, None, None)
+                If calc_velocity=True: (is_visible, theta, r, d_theta, d_r) - includes velocity components
+            """
             try:
                 ts_time = predictor.ts.from_datetime(current_time_utc)
                 
@@ -694,10 +738,55 @@ def try_pyqt5():
                 if elevation_deg >= elevation_mask:
                     theta_rad = np.radians(azimuth_deg)
                     r = 90 - elevation_deg
+                    
+                    if calc_velocity:
+                        # Calculate future position (30 seconds ahead) for velocity arrow
+                        from skyfield.api import utc
+                        future_time = datetime.utcfromtimestamp(
+                            current_time_utc.timestamp() + 3.0
+                        ).replace(tzinfo=utc)
+                        ts_time_future = predictor.ts.from_datetime(future_time)
+                        
+                        relative_future = (predictor.satellite - observer_location).at(ts_time_future)
+                        xyz_future = relative_future.position.au
+                        magnitude_future = (xyz_future[0]**2 + xyz_future[1]**2 + xyz_future[2]**2)**0.5
+                        
+                        horizontal_dist_future = np.sqrt(xyz_future[0]**2 + xyz_future[1]**2)
+                        
+                        if magnitude_future > 0:
+                            elevation_rad_future = np.arctan2(xyz_future[2], horizontal_dist_future)
+                            elevation_deg_future = np.degrees(elevation_rad_future)
+                        else:
+                            elevation_deg_future = elevation_deg
+                        
+                        azimuth_rad_future = np.arctan2(xyz_future[0], xyz_future[1])
+                        azimuth_deg_future = np.degrees(azimuth_rad_future)
+                        if azimuth_deg_future < 0:
+                            azimuth_deg_future += 360
+                        
+                        theta_rad_future = np.radians(azimuth_deg_future)
+                        r_future = 90 - elevation_deg_future
+                        
+                        # Calculate delta (direction of movement)
+                        d_theta = theta_rad_future - theta_rad
+                        d_r = r_future - r
+                        
+                        # Handle wrap-around for azimuth
+                        if d_theta > np.pi:
+                            d_theta -= 2 * np.pi
+                        elif d_theta < -np.pi:
+                            d_theta += 2 * np.pi
+                        
+                        return (True, theta_rad, r, d_theta, d_r)
+                    
                     return (True, theta_rad, r)
                 else:
+                    if calc_velocity:
+                        return (False, None, None, None, None)
                     return (False, None, None)
             except:
+                if calc_velocity:
+                    return (False, None, None, None, None)
                 return (False, None, None)
         
         def check_hidden_satellites(self):
@@ -753,10 +842,17 @@ def try_pyqt5():
             satellites_visible = []
             
             # Only update satellites that are already known to be visible
+            self.visible_sat_data = []  # Reset visible satellite data for click detection
             for predictor in self.visible_predictors:
-                is_visible, theta, r = self.calculate_satellite_position(predictor, current_time_utc, elevation_mask)
-                if is_visible:
-                    satellites_visible.append({'theta': theta, 'r': r})
+                result = self.calculate_satellite_position(predictor, current_time_utc, elevation_mask, calc_velocity=True)
+                if result[0]:  # is_visible
+                    is_visible, theta, r, d_theta, d_r = result
+                    satellites_visible.append({
+                        'theta': theta, 'r': r, 
+                        'd_theta': d_theta, 'd_r': d_r,
+                        'predictor': predictor
+                    })
+                    self.visible_sat_data.append({'theta': theta, 'r': r, 'predictor': predictor})
             
             # Update scatter plots
             if satellites_visible:
@@ -769,6 +865,17 @@ def try_pyqt5():
                 self.satellite_scatter.set_offsets(np.c_[[], []])
                 self.satellite_glow.set_offsets(np.c_[[], []])
             
+            # Update velocity arrows
+            self.update_velocity_arrows(satellites_visible)
+            
+            # Update selected satellite marker if one is selected
+            if self.selected_predictor is not None:
+                is_visible, theta, r = self.calculate_satellite_position(self.selected_predictor, current_time_utc, elevation_mask)
+                if is_visible:
+                    self.selected_marker.set_offsets(np.c_[[theta], [r]])
+                else:
+                    self.selected_marker.set_offsets(np.c_[[], []])
+            
             # Update title
             current_time_aware = current_time_utc.astimezone()
             current_time_str = current_time_aware.strftime('%Y-%m-%d %H:%M:%S %Z')
@@ -779,6 +886,50 @@ def try_pyqt5():
             
             self.visible_label.setText(f"Visible: {num_visible}")
             self.canvas.draw_idle()
+        
+        def update_velocity_arrows(self, satellites_visible):
+            """Update velocity arrows showing satellite direction of movement."""
+            # Remove existing arrows
+            for arrow in self.velocity_arrows:
+                arrow.remove()
+            self.velocity_arrows = []
+            
+            # Arrow scale factor (multiply delta to make arrows visible)
+            # 30 seconds of movement, scaled up for visibility
+            arrow_scale = 10.0
+            
+            for sat in satellites_visible:
+                theta = sat['theta']
+                r = sat['r']
+                d_theta = sat['d_theta']
+                d_r = sat['d_r']
+                
+                if d_theta is None or d_r is None:
+                    continue
+                
+                # Scale the arrow length
+                d_theta_scaled = d_theta * arrow_scale
+                d_r_scaled = d_r * arrow_scale
+                
+                # Only draw arrow if there's meaningful movement
+                movement = np.sqrt(d_theta_scaled**2 + d_r_scaled**2)
+                if movement < 0.01:  # Skip if barely moving
+                    continue
+                
+                # Create arrow using annotate (works well with polar plots)
+                arrow = self.ax.annotate(
+                    '',  # No text
+                    xy=(theta + d_theta_scaled, r + d_r_scaled),  # Arrow head
+                    xytext=(theta, r),  # Arrow tail (satellite position)
+                    arrowprops=dict(
+                        arrowstyle='->,head_width=0.3,head_length=0.2',
+                        color='cyan',
+                        lw=1.2,
+                        alpha=0.8
+                    ),
+                    zorder=3
+                )
+                self.velocity_arrows.append(arrow)
             
         def stop_animation(self):
             """Stop the animation."""
@@ -1008,6 +1159,512 @@ def try_pyqt5():
             self.waterfall_btn.setEnabled(True)
             self.stop_waterfall_btn.setEnabled(False)
             self.status_bar.showMessage("Live waterfall stopped.")
+        
+        def on_satellite_click(self, event):
+            """Handle click on a satellite in the sky map."""
+            if event.artist != self.satellite_scatter:
+                return
+            
+            # Get the index of the clicked point
+            ind = event.ind[0]
+            
+            if ind < len(self.visible_sat_data):
+                sat_data = self.visible_sat_data[ind]
+                self.selected_predictor = sat_data['predictor']
+                
+                # Extract satellite name from TLE
+                try:
+                    # Parse NORAD ID from TLE line 1
+                    tle_line1 = self.selected_predictor.tle_line1
+                    norad_id = tle_line1.split()[1] if len(tle_line1.split()) > 1 else "Unknown"
+                    self.selected_sat_name = f"STARLINK (NORAD {norad_id})"
+                except:
+                    self.selected_sat_name = "Selected Satellite"
+                
+                # Update the selected marker position
+                self.selected_marker.set_offsets(np.c_[[sat_data['theta']], [sat_data['r']]])
+                self.canvas.draw_idle()
+                
+                self.status_bar.showMessage(f"Selected: {self.selected_sat_name} - Computing full pass waterfall...")
+                
+                # Start single satellite waterfall for full pass
+                self.start_single_satellite_waterfall()
+        
+        def find_pass_window(self, predictor, elevation_mask=10.0, search_hours=2.0):
+            """
+            Find the current pass window (rise to set) for a satellite.
+            
+            Returns:
+                (rise_time, set_time, max_el_time) as datetime objects, or None if not found
+            """
+            from skyfield.api import utc
+            from datetime import timedelta
+            
+            current_time = datetime.utcnow().replace(tzinfo=utc)
+            
+            observer_location = predictor.wgs84.latlon(
+                predictor.ue_lat,
+                predictor.ue_lon,
+                elevation_m=predictor.ue_alt * 1000
+            )
+            
+            # Sample times to find the pass
+            dt_step = 10  # seconds
+            num_samples = int(search_hours * 3600 / dt_step)
+            
+            elevations = []
+            times = []
+            
+            for i in range(-num_samples // 4, num_samples):  # Start a bit in the past
+                t = current_time + timedelta(seconds=i * dt_step)
+                ts_time = predictor.ts.from_datetime(t)
+                
+                try:
+                    relative = (predictor.satellite - observer_location).at(ts_time)
+                    xyz = relative.position.au
+                    horizontal_dist = np.sqrt(xyz[0]**2 + xyz[1]**2)
+                    magnitude = np.sqrt(xyz[0]**2 + xyz[1]**2 + xyz[2]**2)
+                    
+                    if magnitude > 0:
+                        elevation_rad = np.arctan2(xyz[2], horizontal_dist)
+                        elevation_deg = np.degrees(elevation_rad)
+                    else:
+                        elevation_deg = -90
+                    
+                    elevations.append(elevation_deg)
+                    times.append(t)
+                except:
+                    elevations.append(-90)
+                    times.append(t)
+            
+            elevations = np.array(elevations)
+            
+            # Find the current pass that includes "now"
+            # Look for where elevation crosses the mask
+            above_mask = elevations >= elevation_mask
+            
+            # Find current index (where i=0, which is at num_samples//4)
+            current_idx = num_samples // 4
+            
+            # If currently not visible, find next pass
+            if not above_mask[current_idx]:
+                # Find next rise
+                for i in range(current_idx, len(above_mask)):
+                    if above_mask[i]:
+                        current_idx = i
+                        break
+                else:
+                    return None  # No pass found
+            
+            # Find rise time (go backwards from current visible position)
+            rise_idx = current_idx
+            for i in range(current_idx, -1, -1):
+                if above_mask[i]:
+                    rise_idx = i
+                else:
+                    break
+            
+            # Find set time (go forwards from current visible position)
+            set_idx = current_idx
+            for i in range(current_idx, len(above_mask)):
+                if above_mask[i]:
+                    set_idx = i
+                else:
+                    break
+            
+            # Find max elevation time
+            pass_elevations = elevations[rise_idx:set_idx+1]
+            if len(pass_elevations) > 0:
+                max_el_idx = rise_idx + np.argmax(pass_elevations)
+            else:
+                max_el_idx = current_idx
+            
+            return (times[rise_idx], times[set_idx], times[max_el_idx])
+        
+        def start_single_satellite_waterfall(self):
+            """Start waterfall display for the selected satellite's complete pass."""
+            if self.selected_predictor is None:
+                return
+            
+            # Stop existing single satellite waterfall if running
+            if self.single_sat_waterfall_running:
+                self.stop_single_satellite_waterfall()
+            
+            from skyfield.api import utc
+            from datetime import timedelta
+            
+            self.single_sat_waterfall_running = True
+            
+            # Get settings
+            self.ss_wf_elevation_mask = float(self.elev_input.text())
+            
+            # Get frequency info
+            self.ss_wf_tx_hz = self.selected_predictor.STARLINK_TX_FREQ
+            self.ss_wf_tx_ghz = self.ss_wf_tx_hz / 1e9
+            self.ss_wf_doppler_range_hz = 500e3  # ±500 kHz
+            self.ss_wf_freq_start_hz = self.ss_wf_tx_hz - self.ss_wf_doppler_range_hz
+            self.ss_wf_freq_end_hz = self.ss_wf_tx_hz + self.ss_wf_doppler_range_hz
+            
+            # Find the pass window
+            pass_info = self.find_pass_window(self.selected_predictor, self.ss_wf_elevation_mask)
+            
+            if pass_info is None:
+                QMessageBox.warning(self, "Warning", "Could not find a visible pass for this satellite.")
+                self.single_sat_waterfall_running = False
+                return
+            
+            self.ss_rise_time, self.ss_set_time, self.ss_max_el_time = pass_info
+            
+            # Calculate pass duration
+            pass_duration_sec = (self.ss_set_time - self.ss_rise_time).total_seconds()
+            pass_duration_min = pass_duration_sec / 60.0
+            
+            # Waterfall dimensions - 1 row per 2 seconds for good resolution
+            self.ss_wf_n_freq_bins = 300
+            self.ss_wf_n_time_samples = max(int(pass_duration_sec / 2), 30)
+            self.ss_wf_sigma = 5e3  # 5 kHz
+            
+            # Create frequency grid
+            self.ss_wf_freq_grid_hz = np.linspace(self.ss_wf_freq_start_hz, self.ss_wf_freq_end_hz, self.ss_wf_n_freq_bins)
+            
+            # Pre-compute the entire pass waterfall
+            self.status_bar.showMessage(f"Computing waterfall for {pass_duration_min:.1f} min pass...")
+            
+            self.single_sat_waterfall_data = np.full((self.ss_wf_n_time_samples, self.ss_wf_n_freq_bins), 250.0)
+            self.ss_time_points = []  # Store time for each row
+            self.ss_elevation_data = []  # Store elevation for each row
+            self.ss_azimuth_data = []  # Store azimuth for each row (for trajectory plot)
+            self.ss_doppler_data = []  # Store Doppler for each row
+            
+            pred = self.selected_predictor
+            observer_location = pred.wgs84.latlon(
+                pred.ue_lat, pred.ue_lon, elevation_m=pred.ue_alt * 1000
+            )
+            
+            for i in range(self.ss_wf_n_time_samples):
+                # Time for this row (from rise to set)
+                t_offset = (i / (self.ss_wf_n_time_samples - 1)) * pass_duration_sec
+                t = self.ss_rise_time + timedelta(seconds=t_offset)
+                self.ss_time_points.append(t)
+                
+                try:
+                    ts_time = pred.ts.from_datetime(t)
+                    relative = (pred.satellite - observer_location).at(ts_time)
+                    xyz = relative.position.au
+                    
+                    AU_TO_METERS = 149597870700
+                    slant_distance_m = np.sqrt(xyz[0]**2 + xyz[1]**2 + xyz[2]**2) * AU_TO_METERS
+                    
+                    horizontal_dist = np.sqrt(xyz[0]**2 + xyz[1]**2)
+                    magnitude = np.sqrt(xyz[0]**2 + xyz[1]**2 + xyz[2]**2)
+                    
+                    if magnitude > 0:
+                        elevation_rad = np.arctan2(xyz[2], horizontal_dist)
+                        elevation_deg = np.degrees(elevation_rad)
+                        
+                        # Calculate azimuth
+                        azimuth_rad = np.arctan2(xyz[0], xyz[1])
+                        azimuth_deg = np.degrees(azimuth_rad)
+                        if azimuth_deg < 0:
+                            azimuth_deg += 360
+                    else:
+                        elevation_deg = -90
+                        azimuth_deg = 0
+                    
+                    self.ss_elevation_data.append(elevation_deg)
+                    self.ss_azimuth_data.append(azimuth_deg)
+                    
+                    # Calculate Doppler
+                    shift = pred.calculate_doppler_shift(t)
+                    self.ss_doppler_data.append(shift / 1000)  # kHz
+                    received_freq = pred.STARLINK_TX_FREQ + shift
+                    
+                    if elevation_deg >= self.ss_wf_elevation_mask:
+                        fspl_db = self.calculate_fspl_db(slant_distance_m, received_freq)
+                        gaussian = np.exp(-((self.ss_wf_freq_grid_hz - received_freq) ** 2) / (2 * self.ss_wf_sigma ** 2))
+                        gaussian_db = -10 * np.log10(gaussian + 1e-10)
+                        signal_loss_db = fspl_db + gaussian_db
+                        self.single_sat_waterfall_data[i, :] = signal_loss_db
+                except:
+                    self.ss_elevation_data.append(-90)
+                    self.ss_azimuth_data.append(0)
+                    self.ss_doppler_data.append(0)
+            
+            # Create waterfall window
+            self.single_sat_waterfall_window = QMainWindow(self)
+            self.single_sat_waterfall_window.setWindowTitle(f"Full Pass Waterfall - {self.selected_sat_name}")
+            self.single_sat_waterfall_window.setGeometry(200, 200, 1400, 850)
+            
+            central = QWidget()
+            self.single_sat_waterfall_window.setCentralWidget(central)
+            layout = QVBoxLayout(central)
+            
+            # Info label
+            rise_str = self.ss_rise_time.astimezone().strftime('%H:%M:%S')
+            set_str = self.ss_set_time.astimezone().strftime('%H:%M:%S')
+            max_el = max(self.ss_elevation_data) if self.ss_elevation_data else 0
+            info_text = f"Satellite: {self.selected_sat_name} | Pass: {rise_str} → {set_str} ({pass_duration_min:.1f} min) | Max Elevation: {max_el:.1f}°"
+            info_label = QLabel(info_text)
+            info_label.setStyleSheet("font-weight: bold; font-size: 12px; padding: 5px; background-color: #2a2a2a; color: white;")
+            layout.addWidget(info_label)
+            
+            # Create figure with GridSpec for flexible layout
+            self.ss_wf_fig = Figure(figsize=(14, 9), dpi=100)
+            
+            # Use GridSpec: 2 rows, 2 columns
+            # Left column (col 0): waterfall (top) and elevation/doppler (bottom)
+            # Right column (col 1): polar trajectory plot (spans both rows)
+            from matplotlib.gridspec import GridSpec
+            gs = GridSpec(2, 2, figure=self.ss_wf_fig, width_ratios=[2, 1], height_ratios=[1, 1],
+                         hspace=0.3, wspace=0.25)
+            
+            # Main waterfall plot (top-left)
+            self.ss_wf_ax = self.ss_wf_fig.add_subplot(gs[0, 0])
+            
+            # Elevation/Doppler plot (bottom-left)
+            self.ss_info_ax = self.ss_wf_fig.add_subplot(gs[1, 0])
+            
+            # Polar trajectory plot (right side, spans both rows)
+            self.ss_polar_ax = self.ss_wf_fig.add_subplot(gs[:, 1], projection='polar')
+            
+            # Plot waterfall
+            freq_start_ghz = self.ss_wf_freq_start_hz / 1e9
+            freq_end_ghz = self.ss_wf_freq_end_hz / 1e9
+            self.ss_wf_extent = [freq_start_ghz, freq_end_ghz, pass_duration_min, 0]
+            
+            # Find valid range for color scaling
+            valid_data = self.single_sat_waterfall_data[self.single_sat_waterfall_data < 200]
+            if len(valid_data) > 0:
+                vmin = np.min(valid_data)
+                vmax = vmin + 15
+            else:
+                vmin, vmax = 170, 185
+            
+            self.ss_wf_im = self.ss_wf_ax.imshow(self.single_sat_waterfall_data, aspect='auto', 
+                                                  extent=self.ss_wf_extent, cmap='jet_r', 
+                                                  vmin=vmin, vmax=vmax, interpolation='bilinear')
+            
+            self.ss_wf_cbar = self.ss_wf_fig.colorbar(self.ss_wf_im, ax=self.ss_wf_ax, pad=0.02)
+            self.ss_wf_cbar.set_label('Path Loss (dB)', fontsize=10)
+            
+            # Mark TX frequency
+            self.ss_wf_ax.axvline(x=self.ss_wf_tx_ghz, color='white', linestyle='--', linewidth=1, alpha=0.7)
+            
+            # Current time marker (horizontal line)
+            self.ss_current_time_line = self.ss_wf_ax.axhline(y=0, color='lime', linestyle='-', linewidth=2, alpha=0.9)
+            
+            self.ss_wf_ax.set_xlabel('Frequency (GHz)', fontsize=11)
+            self.ss_wf_ax.set_ylabel('Time into pass (min)', fontsize=11)
+            self.ss_wf_ax.set_title(f'Doppler Waterfall - Complete Pass\nTX: {self.ss_wf_tx_ghz:.3f} GHz', fontsize=11)
+            
+            # Format x-axis
+            from matplotlib.ticker import FuncFormatter
+            self.ss_wf_ax.xaxis.set_major_formatter(FuncFormatter(lambda x, p: f'{x:.4f}'))
+            
+            # Plot elevation and Doppler
+            time_axis = np.linspace(0, pass_duration_min, self.ss_wf_n_time_samples)
+            
+            ax2 = self.ss_info_ax
+            color1 = 'tab:blue'
+            ax2.set_xlabel('Time into pass (min)', fontsize=11)
+            ax2.set_ylabel('Elevation (°)', color=color1, fontsize=11)
+            ax2.plot(time_axis, self.ss_elevation_data, color=color1, linewidth=2, label='Elevation')
+            ax2.axhline(y=self.ss_wf_elevation_mask, color=color1, linestyle=':', alpha=0.5, label=f'Mask ({self.ss_wf_elevation_mask}°)')
+            ax2.tick_params(axis='y', labelcolor=color1)
+            ax2.set_ylim(0, max(self.ss_elevation_data) * 1.1 + 5)
+            
+            # Doppler on secondary y-axis
+            ax3 = ax2.twinx()
+            color2 = 'tab:red'
+            ax3.set_ylabel('Doppler Shift (kHz)', color=color2, fontsize=11)
+            ax3.plot(time_axis, self.ss_doppler_data, color=color2, linewidth=2, label='Doppler')
+            ax3.axhline(y=0, color=color2, linestyle=':', alpha=0.5)
+            ax3.tick_params(axis='y', labelcolor=color2)
+            
+            # Current time marker for info plot
+            self.ss_info_time_line = ax2.axvline(x=0, color='lime', linestyle='-', linewidth=2, alpha=0.9)
+            
+            # Current position markers
+            self.ss_el_marker, = ax2.plot([0], [self.ss_elevation_data[0] if self.ss_elevation_data else 0], 
+                                          'o', color=color1, markersize=10, zorder=5)
+            self.ss_doppler_marker, = ax3.plot([0], [self.ss_doppler_data[0] if self.ss_doppler_data else 0], 
+                                               'o', color=color2, markersize=10, zorder=5)
+            
+            ax2.set_title('Elevation & Doppler Profile', fontsize=11)
+            ax2.grid(True, alpha=0.3)
+            
+            # === Polar trajectory plot ===
+            self.setup_trajectory_polar_plot()
+            
+            self.ss_wf_fig.tight_layout()
+            
+            self.ss_wf_canvas = FigureCanvas(self.ss_wf_fig)
+            layout.addWidget(self.ss_wf_canvas)
+            
+            toolbar = NavigationToolbar(self.ss_wf_canvas, central)
+            layout.addWidget(toolbar)
+            
+            # Status label for current time
+            self.ss_status_label = QLabel("Initializing...")
+            self.ss_status_label.setStyleSheet("font-size: 11px; padding: 3px;")
+            layout.addWidget(self.ss_status_label)
+            
+            # Close button
+            close_btn = QPushButton("Close")
+            close_btn.clicked.connect(self.stop_single_satellite_waterfall)
+            layout.addWidget(close_btn)
+            
+            self.single_sat_waterfall_window.show()
+            
+            # Connect close event
+            self.single_sat_waterfall_window.closeEvent = lambda e: self.stop_single_satellite_waterfall()
+            
+            # Store pass duration for updates
+            self.ss_pass_duration_min = pass_duration_min
+            self.ss_pass_duration_sec = pass_duration_sec
+            
+            # Start update timer to move the current time marker
+            self.single_sat_waterfall_timer = QTimer()
+            self.single_sat_waterfall_timer.timeout.connect(self.update_single_satellite_waterfall)
+            self.single_sat_waterfall_timer.start(1000)  # Update every second
+            
+            # Initial update
+            self.update_single_satellite_waterfall()
+            
+            self.status_bar.showMessage(f"Showing full pass waterfall for {self.selected_sat_name}")
+        
+        def setup_trajectory_polar_plot(self):
+            """Set up the polar plot showing the satellite's full trajectory across the sky."""
+            ax = self.ss_polar_ax
+            
+            # Configure polar plot (same style as main sky map)
+            ax.set_theta_zero_location('N')
+            ax.set_theta_direction(-1)
+            ax.set_ylim(0, 90)
+            ax.set_rscale('linear')
+            ax.grid(True, alpha=0.4, linestyle='--')
+            
+            # Set ticks
+            ax.set_yticks([0, 15, 30, 45, 60, 75, 90])
+            ax.set_yticklabels(['90°', '75°', '60°', '45°', '30°', '15°', '0°'], fontsize=8)
+            ax.set_rlabel_position(22.5)
+            
+            # Azimuth labels
+            az_deg = np.array([0, 45, 90, 135, 180, 225, 270, 315])
+            az_rad = np.radians(az_deg)
+            ax.set_xticks(az_rad)
+            ax.set_xticklabels(['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'], fontsize=10, fontweight='bold')
+            
+            # Draw elevation mask circle
+            mask_r = 90 - self.ss_wf_elevation_mask
+            theta_circle = np.linspace(0, 2*np.pi, 100)
+            ax.plot(theta_circle, [mask_r]*100, 'r--', linewidth=1, alpha=0.5, label=f'Elev mask ({self.ss_wf_elevation_mask}°)')
+            
+            # Plot zenith marker (center)
+            ax.plot(0, 0, 'r+', markersize=12, markeredgewidth=2, zorder=10)
+            
+            # Convert trajectory data to polar coordinates
+            thetas = np.radians(self.ss_azimuth_data)
+            rs = 90 - np.array(self.ss_elevation_data)
+            
+            # Plot the full trajectory with color gradient (time)
+            # Use scatter for color-coded trajectory
+            colors = np.linspace(0, 1, len(thetas))
+            scatter = ax.scatter(thetas, rs, c=colors, cmap='cool', s=15, alpha=0.7, zorder=3)
+            
+            # Plot trajectory line
+            ax.plot(thetas, rs, 'c-', linewidth=1.5, alpha=0.5, zorder=2)
+            
+            # Mark start (rise) and end (set) points
+            if len(thetas) > 0:
+                ax.scatter([thetas[0]], [rs[0]], c='lime', s=100, marker='^', 
+                          edgecolors='white', linewidths=1, zorder=5, label='Rise')
+                ax.scatter([thetas[-1]], [rs[-1]], c='red', s=100, marker='v', 
+                          edgecolors='white', linewidths=1, zorder=5, label='Set')
+                
+                # Mark max elevation point
+                max_el_idx = np.argmax(self.ss_elevation_data)
+                ax.scatter([thetas[max_el_idx]], [rs[max_el_idx]], c='yellow', s=120, marker='*', 
+                          edgecolors='black', linewidths=0.5, zorder=6, label=f'Max El ({max(self.ss_elevation_data):.1f}°)')
+            
+            # Current position marker (will be updated)
+            self.ss_trajectory_marker = ax.scatter([thetas[0] if len(thetas) > 0 else 0], 
+                                                    [rs[0] if len(rs) > 0 else 90], 
+                                                    c='white', s=150, marker='o', 
+                                                    edgecolors='lime', linewidths=3, zorder=7)
+            
+            ax.set_title('Sky Trajectory', fontsize=11, pad=10)
+            ax.legend(loc='upper left', bbox_to_anchor=(-0.15, 1.15), fontsize=8)
+        
+        def update_single_satellite_waterfall(self):
+            """Update the current time marker on the pre-computed waterfall."""
+            if not self.single_sat_waterfall_running or self.selected_predictor is None:
+                return
+            
+            from skyfield.api import utc
+            
+            current_time_utc = datetime.utcnow().replace(tzinfo=utc)
+            
+            # Calculate position in the pass
+            time_since_rise = (current_time_utc - self.ss_rise_time).total_seconds()
+            time_into_pass_min = time_since_rise / 60.0
+            
+            # Clamp to pass duration
+            time_into_pass_min = max(0, min(time_into_pass_min, self.ss_pass_duration_min))
+            
+            # Update current time line on waterfall
+            self.ss_current_time_line.set_ydata([time_into_pass_min, time_into_pass_min])
+            
+            # Update current time line on info plot
+            self.ss_info_time_line.set_xdata([time_into_pass_min, time_into_pass_min])
+            
+            # Find nearest data index
+            idx = int((time_into_pass_min / self.ss_pass_duration_min) * (self.ss_wf_n_time_samples - 1))
+            idx = max(0, min(idx, len(self.ss_elevation_data) - 1))
+            
+            # Update markers
+            self.ss_el_marker.set_data([time_into_pass_min], [self.ss_elevation_data[idx]])
+            self.ss_doppler_marker.set_data([time_into_pass_min], [self.ss_doppler_data[idx]])
+            
+            # Update trajectory marker on polar plot
+            if hasattr(self, 'ss_trajectory_marker') and idx < len(self.ss_azimuth_data):
+                theta = np.radians(self.ss_azimuth_data[idx])
+                r = 90 - self.ss_elevation_data[idx]
+                self.ss_trajectory_marker.set_offsets([[theta, r]])
+            
+            # Update status
+            current_time_str = current_time_utc.astimezone().strftime('%H:%M:%S %Z')
+            el = self.ss_elevation_data[idx]
+            az = self.ss_azimuth_data[idx] if idx < len(self.ss_azimuth_data) else 0
+            doppler = self.ss_doppler_data[idx]
+            
+            if time_since_rise < 0:
+                status = f"Pass starts in {-time_since_rise:.0f} sec"
+            elif time_since_rise > self.ss_pass_duration_sec:
+                status = f"Pass ended {time_since_rise - self.ss_pass_duration_sec:.0f} sec ago"
+            else:
+                status = f"LIVE | El: {el:.1f}° Az: {az:.1f}° | Doppler: {doppler:+.1f} kHz"
+            
+            self.ss_status_label.setText(f"{current_time_str} | {status}")
+            
+            self.ss_wf_canvas.draw_idle()
+        
+        def stop_single_satellite_waterfall(self):
+            """Stop the single satellite waterfall."""
+            self.single_sat_waterfall_running = False
+            if self.single_sat_waterfall_timer:
+                self.single_sat_waterfall_timer.stop()
+                self.single_sat_waterfall_timer = None
+            
+            # Clear selected satellite marker
+            if hasattr(self, 'selected_marker'):
+                self.selected_marker.set_offsets(np.c_[[], []])
+                self.canvas.draw_idle()
+            
+            self.selected_predictor = None
+            self.selected_sat_name = None
+            
+            self.status_bar.showMessage("Single satellite waterfall stopped.")
                 
         def save_figure(self):
             """Save figure to file."""
@@ -1026,6 +1683,7 @@ def try_pyqt5():
             """Handle window close."""
             self.stop_animation()
             self.stop_waterfall()
+            self.stop_single_satellite_waterfall()
             event.accept()
     
     # Run the application
