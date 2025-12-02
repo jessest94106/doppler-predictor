@@ -1428,7 +1428,7 @@ def try_pyqt5():
             max_el = max(self.ss_elevation_data) if self.ss_elevation_data else 0
             info_text = f"Satellite: {self.selected_sat_name} | Pass: {rise_str} → {set_str} ({pass_duration_min:.1f} min) | Max Elevation: {max_el:.1f}°"
             info_label = QLabel(info_text)
-            info_label.setStyleSheet("font-weight: bold; font-size: 12px; padding: 5px; background-color: #2a2a2a; color: white;")
+            info_label.setStyleSheet("font-weight: bold; font-size: 20px; padding: 5px; background-color: #2a2a2a; color: white;")
             layout.addWidget(info_label)
             
             # Create figure with GridSpec for flexible layout
