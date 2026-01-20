@@ -1085,6 +1085,11 @@ def try_pyqt5():
                                     # Calculate distance
                                     distance_m = magnitude * 1.496e11  # AU to meters
                                     
+                                    # Calculate relative velocity from Doppler
+                                    c = 299792458  # m/s
+                                    velocity_ms = -doppler_hz * c / carrier_freq_hz
+                                    velocity_kms = velocity_ms / 1000  # km/s
+                                    
                                     # Store data point
                                     data_point = {
                                         'timestamp': current_time.isoformat(),
@@ -1092,6 +1097,7 @@ def try_pyqt5():
                                         'azimuth_deg': azimuth_deg,
                                         'elevation_deg': elevation_deg,
                                         'distance_km': distance_m / 1000,
+                                        'relative_velocity_kms': velocity_kms,
                                         'doppler_shift_hz': doppler_hz,
                                         'tx_freq_ghz': carrier_freq_ghz,
                                         'rx_freq_hz': rx_freq_hz,
@@ -1354,7 +1360,7 @@ def try_pyqt5():
                         f.write(f"# Ground Station: Lat={self.datagen_lat_input.text()}°N, Lon={self.datagen_lon_input.text()}°E, Alt={self.datagen_alt_input.text()}m\n")
                         f.write(f"# Start Time (UTC): {self.sim_start_time.dateTime().toString('yyyy-MM-dd HH:mm:ss')}\n")
                         f.write(f"# Duration: {self.sim_duration_input.text()} min, Time Step: {self.sim_timestep_input.text()} sec\n")
-                        f.write(f"# Carrier Frequency: {self.datagen_carrier_freq_input.text()} GHz, Elevation Mask: {self.datagen_elev_input.text()}°\n")
+                        f.write(f"# Carrier Frequency: 10.5 GHz (Starlink default), Elevation Mask: {self.datagen_elev_input.text()}°\n")
                         f.write(f"# Total Data Points: {len(self.generated_data)}, Satellites Tracked: {len(self.satellite_data_dict)}\n")
                         f.write("#\n")
                         
@@ -1376,7 +1382,7 @@ def try_pyqt5():
                         f.write(f"  Start Time (UTC): {self.sim_start_time.dateTime().toString('yyyy-MM-dd HH:mm:ss')}\n")
                         f.write(f"  Duration: {self.sim_duration_input.text()} minutes\n")
                         f.write(f"  Time Step: {self.sim_timestep_input.text()} seconds\n")
-                        f.write(f"  Carrier Frequency: {self.datagen_carrier_freq_input.text()} GHz\n")
+                        f.write(f"  Carrier Frequency: 10.5 GHz (Starlink default)\n")
                         f.write(f"  Elevation Mask: {self.datagen_elev_input.text()}°\n")
                         f.write(f"  Max Satellites: {self.datagen_num_sats_input.text()}\n\n")
                         f.write(f"Results:\n")
@@ -1435,7 +1441,7 @@ def try_pyqt5():
                             f.write(f"# Ground Station: Lat={self.datagen_lat_input.text()}°N, Lon={self.datagen_lon_input.text()}°E, Alt={self.datagen_alt_input.text()}m\n")
                             f.write(f"# Start Time (UTC): {self.sim_start_time.dateTime().toString('yyyy-MM-dd HH:mm:ss')}\n")
                             f.write(f"# Duration: {self.sim_duration_input.text()} min, Time Step: {self.sim_timestep_input.text()} sec\n")
-                            f.write(f"# Carrier Frequency: {self.datagen_carrier_freq_input.text()} GHz, Elevation Mask: {self.datagen_elev_input.text()}°\n")
+                            f.write(f"# Carrier Frequency: 10.5 GHz (Starlink default), Elevation Mask: {self.datagen_elev_input.text()}°\n")
                             f.write(f"# Data Points for this satellite: {len(sat_data)}\n")
                             f.write("#\n")
                             
@@ -2675,12 +2681,18 @@ def terminal_data_generation():
                     rx_freq_hz = pred.STARLINK_TX_FREQ + doppler_hz
                     distance_m = magnitude * 1.496e11
                     
+                    # Calculate relative velocity from Doppler
+                    c = 299792458  # m/s
+                    velocity_ms = -doppler_hz * c / carrier_freq_hz
+                    velocity_kms = velocity_ms / 1000  # km/s
+                    
                     data_point = {
                         'timestamp': current_time.isoformat(),
                         'satellite': pred.sat_name,
                         'azimuth_deg': azimuth_deg,
                         'elevation_deg': elevation_deg,
                         'distance_km': distance_m / 1000,
+                        'relative_velocity_kms': velocity_kms,
                         'doppler_shift_hz': doppler_hz,
                         'tx_freq_ghz': carrier_freq_ghz,
                         'rx_freq_hz': rx_freq_hz,
