@@ -2515,6 +2515,28 @@ def try_pyqt5():
 
 def main():
     """Main entry point - try different GUI backends."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Starlink Doppler Predictor')
+    parser.add_argument('--terminal', action='store_true', 
+                       help='Force terminal mode (data generation only)')
+    parser.add_argument('--no-gui', action='store_true',
+                       help='Same as --terminal')
+    args = parser.parse_args()
+    
+    # Force terminal mode if requested
+    if args.terminal or args.no_gui:
+        print("Starting in terminal mode...")
+        terminal_data_generation()
+        return
+    
+    # Check for display availability
+    import os
+    if not os.environ.get('DISPLAY') and sys.platform != 'darwin' and sys.platform != 'win32':
+        print("No display detected. Starting in terminal mode...")
+        terminal_data_generation()
+        return
+    
     print("Starting Doppler Predictor GUI...")
     
     # Try PyQt5 first
@@ -2528,6 +2550,310 @@ def main():
     
     # Fallback to terminal UI
     print("\nFalling back to terminal interface...")
+    terminal_data_generation()
+
+
+def terminal_data_generation():
+    """Terminal-based data generation interface for headless environments."""
+    print("\n" + "="*60)
+    print("DOPPLER PREDICTOR - DATA GENERATION MODE (Terminal)")
+    print("="*60)
+    
+    # Load TLE data
+    print("\n[1/8] TLE Data")
+    default_tle = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'starlink.txt')
+    if os.path.exists(default_tle):
+        tle_path = input(f"TLE file path (press Enter for '{default_tle}'): ").strip()
+        if not tle_path:
+            tle_path = default_tle
+    else:
+        tle_path = input("TLE file path: ").strip()
+    
+    if not os.path.exists(tle_path):
+        print(f"Error: TLE file not found: {tle_path}")
+        return
+    
+    with open(tle_path, 'r') as f:
+        tle_data = f.read()
+    print(f"✓ Loaded TLE data from {tle_path}")
+    
+    # Ground station location
+    print("\n[2/8] Ground Station Location")
+    lat = float(input("Latitude (°N) [default: 47.6550]: ").strip() or "47.6550")
+    lon = float(input("Longitude (°E) [default: -122.3035]: ").strip() or "-122.3035")
+    alt = float(input("Altitude (m) [default: 60]: ").strip() or "60")
+    
+    ue_location = {
+        'latitude': lat,
+        'longitude': lon,
+        'altitude': alt
+    }
+    print(f"✓ Ground station: {lat}°N, {lon}°E, {alt}m")
+    
+    # Simulation settings
+    print("\n[3/8] Simulation Time Window")
+    start_time_str = input("Start time (UTC, YYYY-MM-DD HH:MM:SS) [press Enter for now]: ").strip()
+    if start_time_str:
+        from datetime import datetime
+        from skyfield.api import utc
+        start_time_utc = datetime.strptime(start_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=utc)
+    else:
+        from datetime import datetime
+        from skyfield.api import utc
+        start_time_utc = datetime.utcnow().replace(tzinfo=utc)
+    print(f"✓ Start time: {start_time_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    
+    print("\n[4/8] Simulation Duration")
+    duration_min = float(input("Duration (minutes) [default: 1]: ").strip() or "1")
+    time_step_sec = float(input("Time step (seconds) [default: 10]: ").strip() or "10")
+    print(f"✓ Duration: {duration_min} min, Time step: {time_step_sec} sec")
+    
+    print("\n[5/8] Satellite Parameters")
+    elevation_mask = float(input("Elevation mask (degrees) [default: 10.0]: ").strip() or "10.0")
+    num_sats = int(input("Max satellites to process [default: 100]: ").strip() or "100")
+    print(f"✓ Elevation mask: {elevation_mask}°, Max satellites: {num_sats}")
+    
+    # Use default carrier frequency
+    carrier_freq_ghz = 10.5
+    carrier_freq_hz = carrier_freq_ghz * 1e9
+    print(f"✓ Using carrier frequency: {carrier_freq_ghz} GHz (Starlink default)")
+    
+    # Output directory
+    print("\n[6/8] Output Settings")
+    output_dir = input("Output directory [default: current directory]: ").strip() or "."
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    print(f"✓ Output directory: {os.path.abspath(output_dir)}")
+    
+    # Create predictor
+    print("\n[7/8] Loading Satellites...")
+    predictor = MultiSatellitePredictor(
+        tle_data, ue_location,
+        num_satellites=num_sats,
+        tx_freq_hz=carrier_freq_hz
+    )
+    print(f"✓ Loaded {len(predictor.predictors)} satellites")
+    
+    # Generate data
+    print("\n[8/8] Generating Data...")
+    from datetime import timedelta
+    
+    num_samples = int((duration_min * 60) / time_step_sec)
+    time_points = [start_time_utc + timedelta(seconds=i*time_step_sec) for i in range(num_samples)]
+    
+    generated_data = []
+    satellite_data_dict = {}
+    
+    for idx, current_time in enumerate(time_points):
+        progress = int((idx / num_samples) * 100)
+        print(f"\rProgress: [{progress:3d}%] {idx+1}/{num_samples} time points", end='', flush=True)
+        
+        for pred in predictor.predictors:
+            try:
+                ts_time = pred.ts.from_datetime(current_time)
+                observer_location = pred.wgs84.latlon(
+                    pred.ue_lat, pred.ue_lon, elevation_m=pred.ue_alt * 1000
+                )
+                
+                relative = (pred.satellite - observer_location).at(ts_time)
+                xyz = relative.position.au
+                magnitude = (xyz[0]**2 + xyz[1]**2 + xyz[2]**2)**0.5
+                horizontal_dist = np.sqrt(xyz[0]**2 + xyz[1]**2)
+                
+                if magnitude > 0:
+                    elevation_deg = np.degrees(np.arctan2(xyz[2], horizontal_dist))
+                else:
+                    elevation_deg = 0
+                
+                if elevation_deg >= elevation_mask:
+                    azimuth_rad = np.arctan2(xyz[0], xyz[1])
+                    azimuth_deg = np.degrees(azimuth_rad)
+                    if azimuth_deg < 0:
+                        azimuth_deg += 360
+                    
+                    doppler_hz = pred.calculate_doppler_shift(current_time)
+                    rx_freq_hz = pred.STARLINK_TX_FREQ + doppler_hz
+                    distance_m = magnitude * 1.496e11
+                    
+                    data_point = {
+                        'timestamp': current_time.isoformat(),
+                        'satellite': pred.sat_name,
+                        'azimuth_deg': azimuth_deg,
+                        'elevation_deg': elevation_deg,
+                        'distance_km': distance_m / 1000,
+                        'doppler_shift_hz': doppler_hz,
+                        'tx_freq_ghz': carrier_freq_ghz,
+                        'rx_freq_hz': rx_freq_hz,
+                        'ue_lat': ue_location['latitude'],
+                        'ue_lon': ue_location['longitude'],
+                        'ue_alt_m': ue_location['altitude'],
+                        'time_minutes': (current_time - start_time_utc).total_seconds() / 60.0
+                    }
+                    
+                    generated_data.append(data_point)
+                    
+                    if pred.sat_name not in satellite_data_dict:
+                        satellite_data_dict[pred.sat_name] = []
+                    satellite_data_dict[pred.sat_name].append(data_point)
+            except:
+                continue
+    
+    print(f"\n✓ Generated {len(generated_data)} data points from {len(satellite_data_dict)} visible satellites")
+    
+    # Save data
+    print("\nSaving data and generating plots...")
+    import csv
+    from datetime import datetime
+    import matplotlib
+    matplotlib.use('Agg')  # Use non-interactive backend
+    import matplotlib.pyplot as plt
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Create satellite directory
+    sat_dir = os.path.join(output_dir, f"satellites_{timestamp}")
+    os.makedirs(sat_dir, exist_ok=True)
+    
+    # Save settings in the satellite directory
+    settings_file = os.path.join(sat_dir, "settings.txt")
+    with open(settings_file, 'w') as f:
+        f.write("Doppler Predictor - Simulation Settings\n")
+        f.write("="*60 + "\n\n")
+        f.write(f"TLE File: {tle_path}\n")
+        f.write(f"Start Time (UTC): {start_time_utc.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Duration (min): {duration_min}\n")
+        f.write(f"Time Step (sec): {time_step_sec}\n")
+        f.write(f"Carrier Frequency (GHz): {carrier_freq_ghz}\n")
+        f.write(f"Elevation Mask (deg): {elevation_mask}\n")
+        f.write(f"Max Satellites: {num_sats}\n")
+        f.write(f"Ground Station Latitude (deg): {lat}\n")
+        f.write(f"Ground Station Longitude (deg): {lon}\n")
+        f.write(f"Ground Station Altitude (m): {alt}\n")
+        f.write(f"\nResults:\n")
+        f.write(f"Total Data Points: {len(generated_data)}\n")
+        f.write(f"Visible Satellites: {len(satellite_data_dict)}\n")
+    print(f"✓ Saved settings: {settings_file}")
+    
+    # Process each satellite
+    total_sats = len(satellite_data_dict)
+    for idx, (sat_name, sat_data) in enumerate(satellite_data_dict.items(), 1):
+        print(f"\r[{idx}/{total_sats}] Processing {sat_name}...", end='', flush=True)
+        
+        safe_name = sat_name.replace('/', '_').replace(' ', '_')
+        
+        # Save CSV
+        sat_csv = os.path.join(sat_dir, f"{safe_name}.csv")
+        with open(sat_csv, 'w', newline='') as csvfile:
+            if sat_data:
+                fieldnames = sat_data[0].keys()
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(sat_data)
+        
+        # Extract data for plotting
+        time_minutes = np.array([d['time_minutes'] for d in sat_data])
+        doppler_hz = np.array([d['doppler_shift_hz'] for d in sat_data])
+        elevation_deg = np.array([d['elevation_deg'] for d in sat_data])
+        azimuth_deg = np.array([d['azimuth_deg'] for d in sat_data])
+        distance_km = np.array([d['distance_km'] for d in sat_data])
+        rx_freq_hz = np.array([d['rx_freq_hz'] for d in sat_data])
+        
+        # Convert Doppler to velocity
+        c = 299792458  # m/s
+        velocity_ms = -doppler_hz * c / carrier_freq_hz
+        velocity_kms = velocity_ms / 1000  # km/s
+        
+        # Create figure with 2 subplots
+        fig = plt.figure(figsize=(14, 10), dpi=100)
+        from matplotlib.gridspec import GridSpec
+        gs = GridSpec(2, 1, figure=fig, height_ratios=[1.2, 1], hspace=0.3)
+        
+        # Waterfall plot
+        ax_waterfall = fig.add_subplot(gs[0])
+        
+        velocity_range_kms = 5.0
+        velocity_start_kms = -velocity_range_kms
+        velocity_end_kms = velocity_range_kms
+        n_velocity_bins = 300
+        n_time_samples = len(time_minutes)
+        
+        velocity_grid_kms = np.linspace(velocity_start_kms, velocity_end_kms, n_velocity_bins)
+        waterfall_data = np.full((n_time_samples, n_velocity_bins), 250.0)
+        
+        sigma_kms = 0.05
+        for i, (vel_kms, dist_km) in enumerate(zip(velocity_kms, distance_km)):
+            if dist_km > 0:
+                dist_m = dist_km * 1000
+                fspl_db = 20 * np.log10(dist_m) + 20 * np.log10(carrier_freq_hz) + 20 * np.log10(4 * np.pi / 299792458)
+                gaussian = np.exp(-0.5 * ((velocity_grid_kms - vel_kms) / sigma_kms) ** 2)
+                waterfall_data[i, :] = fspl_db * (1 - 0.9 * gaussian) + 250.0 * (1 - gaussian)
+        
+        extent = [velocity_start_kms, velocity_end_kms, duration_min, 0]
+        valid_data = waterfall_data[waterfall_data < 200]
+        if len(valid_data) > 0:
+            vmin, vmax = np.percentile(valid_data, [5, 95])
+        else:
+            vmin, vmax = 170, 185
+        
+        im = ax_waterfall.imshow(waterfall_data, aspect='auto', extent=extent,
+                                cmap='jet_r', vmin=vmin, vmax=vmax, interpolation='bilinear')
+        ax_waterfall.axvline(x=0, color='white', linestyle='--', linewidth=1.5, alpha=0.8, label='Zero velocity')
+        ax_waterfall.set_xlabel('Relative Velocity (km/s) [- approaching, + receding]', fontsize=11)
+        ax_waterfall.set_ylabel('Time into pass (min)', fontsize=11)
+        ax_waterfall.set_title(f'Velocity Waterfall - {sat_name}', fontsize=12)
+        ax_waterfall.legend(loc='upper right', fontsize=9)
+        fig.colorbar(im, ax=ax_waterfall, label='Path Loss (dB)')
+        
+        # Trajectory plot
+        ax_traj = fig.add_subplot(gs[1], projection='polar')
+        ax_traj.set_theta_zero_location('N')
+        ax_traj.set_theta_direction(-1)
+        ax_traj.set_ylim(0, 90)
+        ax_traj.set_yticks([0, 15, 30, 45, 60, 75, 90])
+        ax_traj.set_yticklabels(['90°', '75°', '60°', '45°', '30°', '15°', '0°'], fontsize=8)
+        ax_traj.set_rlabel_position(22.5)
+        
+        az_deg_ticks = np.array([0, 45, 90, 135, 180, 225, 270, 315])
+        az_rad_ticks = np.radians(az_deg_ticks)
+        ax_traj.set_xticks(az_rad_ticks)
+        ax_traj.set_xticklabels(['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'], fontsize=10, fontweight='bold')
+        ax_traj.grid(True, alpha=0.4, linestyle='--')
+        
+        mask_r = 90 - elevation_mask
+        theta_circle = np.linspace(0, 2*np.pi, 100)
+        ax_traj.plot(theta_circle, [mask_r]*100, 'r--', linewidth=1, alpha=0.5, label=f'Elev mask ({elevation_mask}°)')
+        ax_traj.plot(0, 0, 'r+', markersize=12, markeredgewidth=2, zorder=10)
+        
+        thetas = np.radians(azimuth_deg)
+        rs = 90 - elevation_deg
+        colors = np.linspace(0, 1, len(thetas))
+        ax_traj.scatter(thetas, rs, c=colors, cmap='cool', s=20, alpha=0.7, zorder=3)
+        ax_traj.plot(thetas, rs, 'c-', linewidth=1.5, alpha=0.5, zorder=2)
+        
+        if len(thetas) > 0:
+            ax_traj.scatter([thetas[0]], [rs[0]], c='green', s=150, marker='^', 
+                          edgecolors='white', linewidths=2, zorder=6, label='Rise')
+            ax_traj.scatter([thetas[-1]], [rs[-1]], c='red', s=150, marker='v',
+                          edgecolors='white', linewidths=2, zorder=6, label='Set')
+        
+        ax_traj.set_title(f'Sky Trajectory - {sat_name}', fontsize=12, pad=10)
+        ax_traj.legend(loc='upper left', bbox_to_anchor=(-0.25, 1.15), fontsize=8)
+        
+        # Save figure
+        fig.tight_layout()
+        plot_file = os.path.join(sat_dir, f"{safe_name}_plot.png")
+        fig.savefig(plot_file, dpi=100, bbox_inches='tight')
+        plt.close(fig)
+    
+    print(f"\n✓ Saved {len(satellite_data_dict)} satellites to: {sat_dir}/")
+    print(f"  - CSV data files")
+    print(f"  - Waterfall + trajectory plots")
+    print(f"  - Settings file")
+    
+    print("\n" + "="*60)
+    print("DATA GENERATION COMPLETE")
+    print("="*60)
+    print(f"\nOutput directory: {os.path.abspath(sat_dir)}")
 
 
 if __name__ == "__main__":
