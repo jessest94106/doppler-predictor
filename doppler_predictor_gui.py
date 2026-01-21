@@ -1084,11 +1084,23 @@ def try_pyqt5():
                                     
                                     # Calculate distance
                                     distance_m = magnitude * 1.496e11  # AU to meters
+                                    distance_km = distance_m / 1000
                                     
                                     # Calculate relative velocity from Doppler
                                     c = 299792458  # m/s
                                     velocity_ms = -doppler_hz * c / carrier_freq_hz
                                     velocity_kms = velocity_ms / 1000  # km/s
+                                    
+                                    # Validate realistic values for LEO satellites
+                                    # Typical Starlink orbit: 500-600 km altitude, so distance 500-5000 km
+                                    # (max slant range at 10° elevation for 600km altitude satellite)
+                                    # Typical relative velocity: -8 to +8 km/s
+                                    if distance_km > 5000 or distance_km < 0:
+                                        # Skip satellites with unrealistic distance (likely bad TLE data)
+                                        continue
+                                    if abs(velocity_kms) > 20:
+                                        # Skip satellites with unrealistic velocity
+                                        continue
                                     
                                     # Store data point
                                     data_point = {
@@ -1096,7 +1108,7 @@ def try_pyqt5():
                                         'satellite': pred.sat_name,
                                         'azimuth_deg': azimuth_deg,
                                         'elevation_deg': elevation_deg,
-                                        'distance_km': distance_m / 1000,
+                                        'distance_km': distance_km,
                                         'relative_velocity_kms': velocity_kms,
                                         'doppler_shift_hz': doppler_hz,
                                         'tx_freq_ghz': carrier_freq_ghz,
@@ -1236,8 +1248,9 @@ def try_pyqt5():
                     gaussian = np.exp(-0.5 * ((velocity_grid_kms - vel_kms) / sigma_kms) ** 2)
                     waterfall_data[i, :] = fspl_db * (1 - 0.9 * gaussian) + 250.0 * (1 - gaussian)
             
-            # Plot waterfall
-            extent = [velocity_start_kms, velocity_end_kms, duration_min, 0]
+            # Plot waterfall - use actual data duration, not configured duration
+            actual_duration_min = (time_minutes[-1] - time_minutes[0]) if len(time_minutes) > 0 else duration_min
+            extent = [velocity_start_kms, velocity_end_kms, actual_duration_min, 0]
             
             valid_data = waterfall_data[waterfall_data < 200]
             if len(valid_data) > 0:
@@ -2680,18 +2693,30 @@ def terminal_data_generation():
                     doppler_hz = pred.calculate_doppler_shift(current_time)
                     rx_freq_hz = pred.STARLINK_TX_FREQ + doppler_hz
                     distance_m = magnitude * 1.496e11
+                    distance_km = distance_m / 1000
                     
                     # Calculate relative velocity from Doppler
                     c = 299792458  # m/s
                     velocity_ms = -doppler_hz * c / carrier_freq_hz
                     velocity_kms = velocity_ms / 1000  # km/s
                     
+                    # Validate realistic values for LEO satellites
+                    # Typical Starlink orbit: 500-600 km altitude, so distance 500-5000 km
+                    # (max slant range at 10° elevation for 600km altitude satellite)
+                    # Typical relative velocity: -8 to +8 km/s
+                    if distance_km > 5000 or distance_km < 0:
+                        # Skip satellites with unrealistic distance (likely bad TLE data)
+                        continue
+                    if abs(velocity_kms) > 20:
+                        # Skip satellites with unrealistic velocity
+                        continue
+                    
                     data_point = {
                         'timestamp': current_time.isoformat(),
                         'satellite': pred.sat_name,
                         'azimuth_deg': azimuth_deg,
                         'elevation_deg': elevation_deg,
-                        'distance_km': distance_m / 1000,
+                        'distance_km': distance_km,
                         'relative_velocity_kms': velocity_kms,
                         'doppler_shift_hz': doppler_hz,
                         'tx_freq_ghz': carrier_freq_ghz,
@@ -2783,27 +2808,37 @@ def terminal_data_generation():
         # Waterfall plot
         ax_waterfall = fig.add_subplot(gs[0])
         
-        velocity_range_kms = 5.0
+        velocity_range_kms = 8.0
         velocity_start_kms = -velocity_range_kms
         velocity_end_kms = velocity_range_kms
         n_velocity_bins = 300
         n_time_samples = len(time_minutes)
         
         velocity_grid_kms = np.linspace(velocity_start_kms, velocity_end_kms, n_velocity_bins)
-        waterfall_data = np.full((n_time_samples, n_velocity_bins), 250.0)
+        
+        # Initialize with constant noise floor (no signal)
+        noise_floor_db = 200.0
+        waterfall_data = np.full((n_time_samples, n_velocity_bins), noise_floor_db)
         
         sigma_kms = 0.05
         for i, (vel_kms, dist_km) in enumerate(zip(velocity_kms, distance_km)):
             if dist_km > 0:
                 dist_m = dist_km * 1000
+                # Calculate actual Free Space Path Loss
                 fspl_db = 20 * np.log10(dist_m) + 20 * np.log10(carrier_freq_hz) + 20 * np.log10(4 * np.pi / 299792458)
+                
+                # Only show path loss at satellite's actual velocity (Gaussian peak)
                 gaussian = np.exp(-0.5 * ((velocity_grid_kms - vel_kms) / sigma_kms) ** 2)
-                waterfall_data[i, :] = fspl_db * (1 - 0.9 * gaussian) + 250.0 * (1 - gaussian)
+                # Background = noise_floor, Signal at satellite velocity = actual path loss
+                waterfall_data[i, :] = noise_floor_db - (noise_floor_db - fspl_db) * gaussian
         
-        extent = [velocity_start_kms, velocity_end_kms, duration_min, 0]
-        valid_data = waterfall_data[waterfall_data < 200]
-        if len(valid_data) > 0:
-            vmin, vmax = np.percentile(valid_data, [5, 95])
+        # Use actual data duration instead of configured duration
+        actual_duration_min = (time_minutes[-1] - time_minutes[0]) if len(time_minutes) > 0 else duration_min
+        extent = [velocity_start_kms, velocity_end_kms, actual_duration_min, 0]
+        # Set colorbar range based on actual signal values (exclude noise floor)
+        signal_data = waterfall_data[waterfall_data < noise_floor_db - 1]
+        if len(signal_data) > 0:
+            vmin, vmax = np.percentile(signal_data, [5, 95])
         else:
             vmin, vmax = 170, 185
         
