@@ -1236,8 +1236,9 @@ def try_pyqt5():
                     gaussian = np.exp(-0.5 * ((velocity_grid_kms - vel_kms) / sigma_kms) ** 2)
                     waterfall_data[i, :] = fspl_db * (1 - 0.9 * gaussian) + 250.0 * (1 - gaussian)
             
-            # Plot waterfall
-            extent = [velocity_start_kms, velocity_end_kms, duration_min, 0]
+            # Plot waterfall - use actual data duration, not configured duration
+            actual_duration_min = time_minutes[-1] if len(time_minutes) > 0 else duration_min
+            extent = [velocity_start_kms, velocity_end_kms, actual_duration_min, 0]
             
             valid_data = waterfall_data[waterfall_data < 200]
             if len(valid_data) > 0:
@@ -2783,7 +2784,7 @@ def terminal_data_generation():
         # Waterfall plot
         ax_waterfall = fig.add_subplot(gs[0])
         
-        velocity_range_kms = 5.0
+        velocity_range_kms = 8.0
         velocity_start_kms = -velocity_range_kms
         velocity_end_kms = velocity_range_kms
         n_velocity_bins = 300
@@ -2800,7 +2801,9 @@ def terminal_data_generation():
                 gaussian = np.exp(-0.5 * ((velocity_grid_kms - vel_kms) / sigma_kms) ** 2)
                 waterfall_data[i, :] = fspl_db * (1 - 0.9 * gaussian) + 250.0 * (1 - gaussian)
         
-        extent = [velocity_start_kms, velocity_end_kms, duration_min, 0]
+        # Use actual data duration instead of configured duration
+        actual_duration_min = time_minutes[-1] if len(time_minutes) > 0 else duration_min
+        extent = [velocity_start_kms, velocity_end_kms, actual_duration_min, 0]
         valid_data = waterfall_data[waterfall_data < 200]
         if len(valid_data) > 0:
             vmin, vmax = np.percentile(valid_data, [5, 95])
