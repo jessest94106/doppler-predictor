@@ -1237,7 +1237,7 @@ def try_pyqt5():
                     waterfall_data[i, :] = fspl_db * (1 - 0.9 * gaussian) + 250.0 * (1 - gaussian)
             
             # Plot waterfall - use actual data duration, not configured duration
-            actual_duration_min = time_minutes[-1] if len(time_minutes) > 0 else duration_min
+            actual_duration_min = (time_minutes[-1] - time_minutes[0]) if len(time_minutes) > 0 else duration_min
             extent = [velocity_start_kms, velocity_end_kms, actual_duration_min, 0]
             
             valid_data = waterfall_data[waterfall_data < 200]
@@ -2802,7 +2802,7 @@ def terminal_data_generation():
                 waterfall_data[i, :] = fspl_db * (1 - 0.9 * gaussian) + 250.0 * (1 - gaussian)
         
         # Use actual data duration instead of configured duration
-        actual_duration_min = time_minutes[-1] if len(time_minutes) > 0 else duration_min
+        actual_duration_min = (time_minutes[-1] - time_minutes[0]) if len(time_minutes) > 0 else duration_min
         extent = [velocity_start_kms, velocity_end_kms, actual_duration_min, 0]
         valid_data = waterfall_data[waterfall_data < 200]
         if len(valid_data) > 0:
