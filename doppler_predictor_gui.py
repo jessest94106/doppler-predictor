@@ -1063,28 +1063,20 @@ def try_pyqt5():
                                 )
                                 
                                 relative = (pred.satellite - observer_location).at(ts_time)
-                                xyz = relative.position.au
-                                magnitude = (xyz[0]**2 + xyz[1]**2 + xyz[2]**2)**0.5
-                                horizontal_dist = np.sqrt(xyz[0]**2 + xyz[1]**2)
                                 
-                                if magnitude > 0:
-                                    elevation_deg = np.degrees(np.arctan2(xyz[2], horizontal_dist))
-                                else:
-                                    elevation_deg = 0
+                                # Use Skyfield's proper altaz() method for correct horizon coordinates
+                                # FIXED: Previously used inertial frame coordinates incorrectly
+                                # Old buggy method calculated azimuth/elevation from J2000 frame xyz directly
+                                # which gave wrong values (azimuth ~257° off, elevation errors increasing with angle)
+                                alt, az, distance = relative.altaz()
+                                elevation_deg = alt.degrees
+                                azimuth_deg = az.degrees
+                                distance_km = distance.km
                                 
                                 if elevation_deg >= elevation_mask:
-                                    azimuth_rad = np.arctan2(xyz[0], xyz[1])
-                                    azimuth_deg = np.degrees(azimuth_rad)
-                                    if azimuth_deg < 0:
-                                        azimuth_deg += 360
-                                    
                                     # Calculate Doppler shift
                                     doppler_hz = pred.calculate_doppler_shift(current_time)
                                     rx_freq_hz = pred.STARLINK_TX_FREQ + doppler_hz
-                                    
-                                    # Calculate distance
-                                    distance_m = magnitude * 1.496e11  # AU to meters
-                                    distance_km = distance_m / 1000
                                     
                                     # Calculate relative velocity from Doppler
                                     c = 299792458  # m/s
@@ -1535,28 +1527,18 @@ def try_pyqt5():
                 )
                 
                 relative = (predictor.satellite - observer_location).at(ts_time)
-                xyz = relative.position.au
-                magnitude = (xyz[0]**2 + xyz[1]**2 + xyz[2]**2)**0.5
                 
-                horizontal_dist = np.sqrt(xyz[0]**2 + xyz[1]**2)
-                
-                if magnitude > 0:
-                    elevation_rad = np.arctan2(xyz[2], horizontal_dist)
-                    elevation_deg = np.degrees(elevation_rad)
-                else:
-                    elevation_deg = -90
-                
-                azimuth_rad = np.arctan2(xyz[0], xyz[1])
-                azimuth_deg = np.degrees(azimuth_rad)
-                if azimuth_deg < 0:
-                    azimuth_deg += 360
+                # Use Skyfield's proper altaz() method for correct horizon coordinates
+                alt, az, distance = relative.altaz()
+                elevation_deg = alt.degrees
+                azimuth_deg = az.degrees
                 
                 if elevation_deg >= elevation_mask:
                     theta_rad = np.radians(azimuth_deg)
                     r = 90 - elevation_deg
                     
                     if calc_velocity:
-                        # Calculate future position (30 seconds ahead) for velocity arrow
+                        # Calculate future position (1 second ahead) for velocity arrow
                         from skyfield.api import utc
                         future_time = datetime.utcfromtimestamp(
                             current_time_utc.timestamp() + 1.0
@@ -1564,21 +1546,9 @@ def try_pyqt5():
                         ts_time_future = predictor.ts.from_datetime(future_time)
                         
                         relative_future = (predictor.satellite - observer_location).at(ts_time_future)
-                        xyz_future = relative_future.position.au
-                        magnitude_future = (xyz_future[0]**2 + xyz_future[1]**2 + xyz_future[2]**2)**0.5
-                        
-                        horizontal_dist_future = np.sqrt(xyz_future[0]**2 + xyz_future[1]**2)
-                        
-                        if magnitude_future > 0:
-                            elevation_rad_future = np.arctan2(xyz_future[2], horizontal_dist_future)
-                            elevation_deg_future = np.degrees(elevation_rad_future)
-                        else:
-                            elevation_deg_future = elevation_deg
-                        
-                        azimuth_rad_future = np.arctan2(xyz_future[0], xyz_future[1])
-                        azimuth_deg_future = np.degrees(azimuth_rad_future)
-                        if azimuth_deg_future < 0:
-                            azimuth_deg_future += 360
+                        alt_future, az_future, distance_future = relative_future.altaz()
+                        elevation_deg_future = alt_future.degrees
+                        azimuth_deg_future = az_future.degrees
                         
                         theta_rad_future = np.radians(azimuth_deg_future)
                         r_future = 90 - elevation_deg_future
@@ -2194,21 +2164,10 @@ def try_pyqt5():
                     AU_TO_METERS = 149597870700
                     slant_distance_m = np.sqrt(xyz[0]**2 + xyz[1]**2 + xyz[2]**2) * AU_TO_METERS
                     
-                    horizontal_dist = np.sqrt(xyz[0]**2 + xyz[1]**2)
-                    magnitude = np.sqrt(xyz[0]**2 + xyz[1]**2 + xyz[2]**2)
-                    
-                    if magnitude > 0:
-                        elevation_rad = np.arctan2(xyz[2], horizontal_dist)
-                        elevation_deg = np.degrees(elevation_rad)
-                        
-                        # Calculate azimuth
-                        azimuth_rad = np.arctan2(xyz[0], xyz[1])
-                        azimuth_deg = np.degrees(azimuth_rad)
-                        if azimuth_deg < 0:
-                            azimuth_deg += 360
-                    else:
-                        elevation_deg = -90
-                        azimuth_deg = 0
+                    # Use Skyfield's proper altaz() method
+                    alt, az, distance = relative.altaz()
+                    elevation_deg = alt.degrees
+                    azimuth_deg = az.degrees
                     
                     self.ss_elevation_data.append(elevation_deg)
                     self.ss_azimuth_data.append(azimuth_deg)
@@ -2675,25 +2634,16 @@ def terminal_data_generation():
                 )
                 
                 relative = (pred.satellite - observer_location).at(ts_time)
-                xyz = relative.position.au
-                magnitude = (xyz[0]**2 + xyz[1]**2 + xyz[2]**2)**0.5
-                horizontal_dist = np.sqrt(xyz[0]**2 + xyz[1]**2)
                 
-                if magnitude > 0:
-                    elevation_deg = np.degrees(np.arctan2(xyz[2], horizontal_dist))
-                else:
-                    elevation_deg = 0
+                # Use Skyfield's proper altaz() method
+                alt, az, distance = relative.altaz()
+                elevation_deg = alt.degrees
+                azimuth_deg = az.degrees
+                distance_km = distance.km
                 
                 if elevation_deg >= elevation_mask:
-                    azimuth_rad = np.arctan2(xyz[0], xyz[1])
-                    azimuth_deg = np.degrees(azimuth_rad)
-                    if azimuth_deg < 0:
-                        azimuth_deg += 360
-                    
                     doppler_hz = pred.calculate_doppler_shift(current_time)
                     rx_freq_hz = pred.STARLINK_TX_FREQ + doppler_hz
-                    distance_m = magnitude * 1.496e11
-                    distance_km = distance_m / 1000
                     
                     # Calculate relative velocity from Doppler
                     c = 299792458  # m/s
