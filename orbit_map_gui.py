@@ -12,7 +12,8 @@ from datetime import datetime
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QSlider, QPushButton, QTabWidget, QGroupBox,
-    QFormLayout, QCheckBox, QSpinBox, QDoubleSpinBox, QDateTimeEdit
+    QFormLayout, QCheckBox, QSpinBox, QDoubleSpinBox, QDateTimeEdit,
+    QGridLayout
 )
 from PyQt5.QtCore import Qt, QTimer, QDateTime
 from PyQt5.QtGui import QFont, QValidator, QDoubleValidator
@@ -86,7 +87,7 @@ class OrbitalMechanics:
     @staticmethod
     def generate_orbit(a, e, i, Omega, omega, M0, num_points=200):
         """
-        Generate orbit points around Earth.
+        Generate orbit points around Earth (vectorized).
         
         Args:
             a: Semi-major axis (m)
@@ -100,13 +101,31 @@ class OrbitalMechanics:
         Returns:
             Array of shape (num_points, 3) with [x, y, z] coordinates
         """
-        orbit_points = []
-        for j in range(num_points):
-            nu = 2 * np.pi * j / num_points
-            pos = OrbitalMechanics.kepler_to_cartesian(a, e, i, Omega, omega, nu)
-            orbit_points.append(pos)
+        nu = np.linspace(0, 2 * np.pi, num_points, endpoint=False)
         
-        return np.array(orbit_points)
+        # Distance from focus (vectorized)
+        r = a * (1 - e**2) / (1 + e * np.cos(nu))
+        
+        # Perifocal coordinates
+        x_peri = r * np.cos(nu)
+        y_peri = r * np.sin(nu)
+        
+        # Rotation constants
+        cos_O = np.cos(Omega)
+        sin_O = np.sin(Omega)
+        cos_w = np.cos(omega)
+        sin_w = np.sin(omega)
+        cos_i = np.cos(i)
+        sin_i = np.sin(i)
+        
+        # Transform from perifocal to ECI (vectorized)
+        x = (cos_O * cos_w - sin_O * sin_w * cos_i) * x_peri + \
+            (-cos_O * sin_w - sin_O * cos_w * cos_i) * y_peri
+        y = (sin_O * cos_w + cos_O * sin_w * cos_i) * x_peri + \
+            (-sin_O * sin_w + cos_O * cos_w * cos_i) * y_peri
+        z = sin_i * sin_w * x_peri + sin_i * cos_w * y_peri
+        
+        return np.column_stack([x, y, z])
 
 
 class OrbitMapGUI(QMainWindow):
@@ -138,10 +157,23 @@ class OrbitMapGUI(QMainWindow):
         self.earth_sphere_cache = None  # Cache for 3D sphere geometry and colors
         self.load_sphere_cache()
         
+        # Link budget parameters
+        self.carrier_freq = 2.4  # GHz
+        
         # Simulation state
         self.simulation_time = datetime.now()
         self.is_playing = False
         self.time_step = 50  # seconds per update
+        
+        # Store ground track data for click interaction
+        self.ground_track_data = []  # List of (lon, lat, time_offset) tuples
+        
+        # Cache for link plot data (so it doesn't recalculate during animation)
+        self.link_plot_cache = None
+        self.link_plot_artists = None
+        
+        # 3D scene: track dynamic label actors for manual removal
+        self._3d_label_actors = []
         
         # Create UI
         self.init_ui()
@@ -151,12 +183,11 @@ class OrbitMapGUI(QMainWindow):
         self.sim_timer.timeout.connect(self.update_simulation)
         self.sim_timer.setInterval(10)  # Fast interval for responsive pause
         
-        # Store ground track data for click interaction
-        self.ground_track_data = []  # List of (lon, lat, time_offset) tuples
-        
-        # Cache for link plot data (so it doesn't recalculate during animation)
-        self.link_plot_cache = None  # Will store (times, elevations, azimuths, zenith_angles, dopplers)
-        self.link_plot_artists = None  # Will store matplotlib artist objects for efficient updates
+        # Debounce timer for 3D updates (slider dragging causes many rapid calls)
+        self._3d_update_timer = QTimer()
+        self._3d_update_timer.setSingleShot(True)
+        self._3d_update_timer.setInterval(10)  # 50ms debounce
+        self._3d_update_timer.timeout.connect(self._deferred_3d_update)
         
     def load_earth_texture(self):
         """Load Earth texture image from NASA Blue Marble"""
@@ -271,13 +302,19 @@ class OrbitMapGUI(QMainWindow):
         # 2D map (left side of bottom row)
         self.fig_2d = Figure(figsize=(6, 3), dpi=100)
         self.canvas_2d = FigureCanvas(self.fig_2d)
-        self.canvas_2d.mpl_connect('button_press_event', self.on_2d_map_click)
+        self.canvas_2d.mpl_connect('button_press_event', self.on_2d_map_press)
+        self.canvas_2d.mpl_connect('motion_notify_event', self.on_2d_map_drag)
+        self.canvas_2d.mpl_connect('button_release_event', self.on_2d_map_release)
+        self._dragging_satellite = False
         bottom_layout.addWidget(self.canvas_2d, 1)
         
         # Link plots - polar + elevation/Doppler (right side of bottom row)
         self.fig_link = Figure(figsize=(8, 3), dpi=100)
         self.canvas_link = FigureCanvas(self.fig_link)
         bottom_layout.addWidget(self.canvas_link, 1)
+        
+        # Initialize static 3D elements (Earth sphere + axis arrows) once
+        self.init_3d_scene()
         
         # Draw initial plots
         self.update_plots()
@@ -340,7 +377,10 @@ class OrbitMapGUI(QMainWindow):
     def create_parameter_group(self):
         """Create orbital parameters input group"""
         group = QGroupBox("Orbital Parameters")
-        layout = QFormLayout()
+        layout = QGridLayout()
+        layout.setColumnStretch(0, 0)  # Label - fixed width
+        layout.setColumnStretch(1, 0)  # Input box - fixed width
+        layout.setColumnStretch(2, 1)  # Slider - takes all remaining space
         
         # Define parameter specifications
         param_specs = {
@@ -348,14 +388,14 @@ class OrbitMapGUI(QMainWindow):
             'e': ('Eccentricity', 0.0, 1.0, 0.01),
             'i': ('Inclination (°)', 0, 180, 1),
             'Omega': ('RAAN (°)', 0, 360, 1),
-            'omega': ('Argument of Perigee (°)', 0, 360, 5),
-            'M0': ('Mean Anomaly (°)', 0, 360, 5)
+            'omega': ('Arg of Perigee (°)', 0, 360, 1),
+            'M0': ('Mean Anomaly (°)', 0, 360, 1)
         }
         
         self.param_inputs = {}
         self.param_sliders = {}
         
-        for param, (label, min_val, max_val, step) in param_specs.items():
+        for row, (param, (label, min_val, max_val, step)) in enumerate(param_specs.items()):
             # Input box
             if param == 'a':
                 # Convert semi-major axis (stored) to height above surface (displayed)
@@ -365,13 +405,16 @@ class OrbitMapGUI(QMainWindow):
             else:
                 default = self.params[param]
             
+            lbl = QLabel(label)
+            lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            
             input_box = QDoubleSpinBox()
             input_box.setMinimum(min_val)
             input_box.setMaximum(max_val)
             input_box.setSingleStep(step)
             input_box.setValue(default)
             input_box.setDecimals(2 if param == 'e' else 0)
-            input_box.setMaximumWidth(100)
+            input_box.setFixedWidth(70)
             input_box.valueChanged.connect(self.on_param_changed)
             
             self.param_inputs[param] = input_box
@@ -387,11 +430,10 @@ class OrbitMapGUI(QMainWindow):
             
             self.param_sliders[param] = slider
             
-            # Add to layout
-            row_layout = QHBoxLayout()
-            row_layout.addWidget(input_box, 1)
-            row_layout.addWidget(slider, 2)
-            layout.addRow(label, row_layout)
+            # Add to grid: label | input | slider
+            layout.addWidget(lbl, row, 0)
+            layout.addWidget(input_box, row, 1)
+            layout.addWidget(slider, row, 2)
         
         group.setLayout(layout)
         return group
@@ -399,39 +441,49 @@ class OrbitMapGUI(QMainWindow):
     def create_location_group(self):
         """Create user location input group"""
         group = QGroupBox("User Location")
-        layout = QFormLayout()
+        layout = QGridLayout()
         
-        # Latitude
+        # Row 0: Latitude | Longitude
         self.lat_input = QDoubleSpinBox()
         self.lat_input.setMinimum(-90)
         self.lat_input.setMaximum(90)
         self.lat_input.setValue(self.user_location['lat'])
         self.lat_input.setDecimals(4)
         self.lat_input.setSingleStep(0.1)
-        self.lat_input.setMaximumWidth(100)
         self.lat_input.valueChanged.connect(self.on_location_changed)
-        layout.addRow("Latitude (°)", self.lat_input)
+        layout.addWidget(QLabel("Lat (°)"), 0, 0)
+        layout.addWidget(self.lat_input, 0, 1)
         
-        # Longitude
         self.lon_input = QDoubleSpinBox()
         self.lon_input.setMinimum(-180)
         self.lon_input.setMaximum(180)
         self.lon_input.setValue(self.user_location['lon'])
         self.lon_input.setDecimals(4)
         self.lon_input.setSingleStep(0.1)
-        self.lon_input.setMaximumWidth(100)
         self.lon_input.valueChanged.connect(self.on_location_changed)
-        layout.addRow("Longitude (°)", self.lon_input)
+        layout.addWidget(QLabel("Lon (°)"), 0, 2)
+        layout.addWidget(self.lon_input, 0, 3)
         
-        # Altitude
+        # Row 1: Altitude | Carrier Freq
         self.alt_input = QDoubleSpinBox()
         self.alt_input.setMinimum(0)
         self.alt_input.setMaximum(5000)
         self.alt_input.setValue(self.user_location['alt'])
         self.alt_input.setDecimals(1)
         self.alt_input.setSingleStep(10)
-        self.alt_input.setMaximumWidth(100)
-        layout.addRow("Altitude (m)", self.alt_input)
+        layout.addWidget(QLabel("Alt (m)"), 1, 0)
+        layout.addWidget(self.alt_input, 1, 1)
+        
+        self.freq_input = QDoubleSpinBox()
+        self.freq_input.setMinimum(0.01)
+        self.freq_input.setMaximum(100.0)
+        self.freq_input.setValue(self.carrier_freq)
+        self.freq_input.setDecimals(3)
+        self.freq_input.setSingleStep(0.1)
+        self.freq_input.setSuffix(" GHz")
+        self.freq_input.valueChanged.connect(self.on_freq_changed)
+        layout.addWidget(QLabel("Freq"), 1, 2)
+        layout.addWidget(self.freq_input, 1, 3)
         
         group.setLayout(layout)
         return group
@@ -472,7 +524,11 @@ class OrbitMapGUI(QMainWindow):
             else:
                 self.params[param] = value
         
-        self.update_plots()
+        # Update 2D and link plots immediately (fast)
+        self.update_2d_plot()
+        self.update_link_plots(update_only_current_position=False)
+        # Update 3D directly (fast now — no Earth/axes rebuild)
+        self.update_3d_plot()
     
     def on_location_changed(self):
         """Handle location changes"""
@@ -480,6 +536,13 @@ class OrbitMapGUI(QMainWindow):
         self.user_location['lon'] = self.lon_input.value()
         self.user_location['alt'] = self.alt_input.value()
         self.update_plots()
+    
+    def on_freq_changed(self):
+        """Handle carrier frequency changes"""
+        self.carrier_freq = self.freq_input.value()
+        self.link_plot_cache = None  # Force recalculation with new frequency
+        self.link_plot_artists = None
+        self.update_link_plots(update_only_current_position=False)
     
     def reset_3d_camera(self):
         """Reset 3D camera to center on user location"""
@@ -645,42 +708,64 @@ class OrbitMapGUI(QMainWindow):
         if self.is_playing:
             self.update_3d_plot()
     
-    def on_2d_map_click(self, event):
-        """Handle clicks on 2D map to jump to that time"""
-        # Only process if click is within axes and we have ground track data
-        if event.inaxes is None or len(self.ground_track_data) == 0:
-            return
-        
-        # Get click coordinates
-        click_lon = event.xdata
-        click_lat = event.ydata
-        
-        # Find closest point on ground track
+    def _find_closest_track_point(self, click_lon, click_lat):
+        """Find closest ground track point to the given coordinates.
+        Returns (min_dist, relative_time) or (inf, 0) if no data."""
         min_dist = float('inf')
         closest_time = 0
-        
         for lon, lat, time_offset in self.ground_track_data:
-            # Simple distance metric (not perfect for spherical coordinates but good enough)
             dist = np.sqrt((lon - click_lon)**2 + (lat - click_lat)**2)
             if dist < min_dist:
                 min_dist = dist
                 closest_time = time_offset
-        
-        # Only jump if click is reasonably close (within 20 degrees)
+        return min_dist, closest_time
+
+    def _jump_satellite_to_time(self, relative_time):
+        """Move the satellite by the given relative time offset."""
+        a = self.params['a']
+        mu = 3.986004418e14
+        T = 2 * np.pi * np.sqrt(a**3 / mu)
+
+        delta_M = (relative_time / T) * 360  # degrees
+        self.params['M0'] = (self.params['M0'] + delta_M) % 360
+
+        # Sync input box and slider
+        self.param_inputs['M0'].blockSignals(True)
+        self.param_inputs['M0'].setValue(self.params['M0'])
+        self.param_inputs['M0'].blockSignals(False)
+        self.param_sliders['M0'].blockSignals(True)
+        self.param_sliders['M0'].setValue(int(self.params['M0'] * 100))
+        self.param_sliders['M0'].blockSignals(False)
+
+        # Clear link plot cache
+        self.link_plot_cache = None
+        self.link_plot_artists = None
+
+    def on_2d_map_press(self, event):
+        """Start dragging if click is near the satellite or on the track"""
+        if event.inaxes is None or len(self.ground_track_data) == 0:
+            return
+        min_dist, closest_time = self._find_closest_track_point(event.xdata, event.ydata)
         if min_dist < 20:
-            # Calculate orbital period
-            a = self.params['a']
-            mu = 3.986004418e14
-            T = 2 * np.pi * np.sqrt(a**3 / mu)
-            
-            # Update mean anomaly based on time offset
-            delta_M = (closest_time / T) * 360  # degrees
-            self.params['M0'] = (self.params['M0'] + delta_M) % 360
-            
-            # Update the input box
-            self.param_inputs['M0'].setValue(self.params['M0'])
-            
-            # Update visualization
+            self._dragging_satellite = True
+            self._jump_satellite_to_time(closest_time)
+            self.update_plots()
+
+    def on_2d_map_drag(self, event):
+        """While dragging, continuously move satellite to closest track point"""
+        if not self._dragging_satellite or event.inaxes is None or len(self.ground_track_data) == 0:
+            return
+        min_dist, closest_time = self._find_closest_track_point(event.xdata, event.ydata)
+        if min_dist < 30:
+            self._jump_satellite_to_time(closest_time)
+            # Only update 2D for responsiveness during drag
+            self.update_2d_plot()
+            self.update_link_plots(update_only_current_position=False)
+
+    def on_2d_map_release(self, event):
+        """Stop dragging and do a full update"""
+        if self._dragging_satellite:
+            self._dragging_satellite = False
             self.update_plots()
     
     def update_plots(self):
@@ -713,12 +798,53 @@ class OrbitMapGUI(QMainWindow):
         user_lon = self.user_location['lon']
         ax.plot(user_lon, user_lat, 'go', markersize=8, label='User Location', zorder=7)
         
+        # Calculate satellite sub-point and draw link line if visible
+        pos_sat = OrbitalMechanics.kepler_to_cartesian(a, self.params['e'], i, Omega, omega, M0)
+        sx, sy, sz = pos_sat
+        sat_r_xy = np.sqrt(sx**2 + sy**2)
+        
+        # Apply Earth rotation to match ground track
+        mu = 3.986004418e14
+        T = 2 * np.pi * np.sqrt(a**3 / mu)
+        earth_rotation_rate = 2 * np.pi / 86400.0
+        time_from_track_start = (M0 / (2 * np.pi)) * T
+        earth_rot = earth_rotation_rate * time_from_track_start
+        
+        sat_lon_eci = np.arctan2(sy, sx)
+        sat_lon = np.degrees(sat_lon_eci - earth_rot) % 360
+        if sat_lon > 180:
+            sat_lon -= 360
+        sat_lat = np.degrees(np.arctan2(sz, sat_r_xy))
+        
+        # Check elevation to decide link line color
+        user_r = OrbitalMechanics.EARTH_RADIUS + self.user_location['alt']
+        user_rad_lat = np.radians(user_lat)
+        user_rad_lon = np.radians(user_lon)
+        user_pos = np.array([
+            user_r * np.cos(user_rad_lat) * np.cos(user_rad_lon),
+            user_r * np.cos(user_rad_lat) * np.sin(user_rad_lon),
+            user_r * np.sin(user_rad_lat)
+        ])
+        to_sat = pos_sat - user_pos
+        local_up = user_pos / np.linalg.norm(user_pos)
+        to_sat_norm = to_sat / np.linalg.norm(to_sat)
+        elevation_deg = np.degrees(np.arcsin(np.dot(to_sat_norm, local_up)))
+        
+        if elevation_deg > 0:
+            ax.plot([user_lon, sat_lon], [user_lat, sat_lat], 'c-', linewidth=2,
+                    alpha=0.8, label=f'Link (El: {elevation_deg:.1f}°)', zorder=6)
+        else:
+            ax.plot([user_lon, sat_lon], [user_lat, sat_lat], 'r--', linewidth=1,
+                    alpha=0.4, label=f'No Link (El: {elevation_deg:.1f}°)', zorder=6)
+        
         # Formatting
         ax.set_xlabel('Longitude (°)', fontsize=10)
         ax.set_ylabel('Latitude (°)', fontsize=10)
         ax.set_title('2d Satellite Ground Track Map', fontsize=12, fontweight='bold')
         ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
-        ax.legend(loc='upper right', fontsize=7, framealpha=0.8)
+        ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1), fontsize=9, framealpha=0.8, borderaxespad=0,
+                 prop={'weight': 'bold', 'size': 9})
+        self.fig_2d.subplots_adjust(right=0.75)
         
         # Set limits to world map
         ax.set_xlim(-180, 180)
@@ -758,6 +884,9 @@ class OrbitMapGUI(QMainWindow):
         # RAAN precession rate (radians per second) due to J2
         Omega_dot = -1.5 * n * J2 * (Re / a)**2 * np.cos(i)
         
+        # Current mean anomaly as fraction of orbit
+        M0_frac = M0 / (2 * np.pi)  # Fraction of orbit elapsed
+        
         # Generate multiple passes to show ground track pattern
         colors = ['red', 'orange', 'yellow']
         num_points = 180  # Points per orbit
@@ -780,6 +909,12 @@ class OrbitMapGUI(QMainWindow):
                 # Approximate: assume circular orbit for time calculation
                 time_in_orbit = T * j / num_points
                 total_time = time_offset + time_in_orbit
+                
+                # Time relative to current satellite position (for click-to-jump)
+                # Current position is at M0, this point is at nu in orbit orbit_num
+                # The anomaly difference from current position:
+                nu_diff = nu - M0  # radians difference within this orbit
+                relative_time = time_offset + (nu_diff / (2 * np.pi)) * T
                 
                 # Get satellite position in ECI (inertial frame) with updated RAAN
                 pos_eci = OrbitalMechanics.kepler_to_cartesian(a, e, i, Omega_pass, omega, nu)
@@ -807,8 +942,8 @@ class OrbitMapGUI(QMainWindow):
                 track_lats.append(lat)
                 track_lons.append(lon)
                 
-                # Store for click interaction (time offset from current position)
-                self.ground_track_data.append((lon, lat, total_time))
+                # Store relative time for click interaction
+                self.ground_track_data.append((lon, lat, relative_time))
             
             # Split track at discontinuities (when crossing ±180° boundary)
             color = colors[orbit_num % len(colors)]
@@ -841,25 +976,73 @@ class OrbitMapGUI(QMainWindow):
                        label=label, zorder=5)
         
         # Plot current satellite position on map (using current mean anomaly M0)
-        # For simplicity, use M0 directly as true anomaly (valid for circular orbits)
-        # For eccentric orbits, should convert M0 -> E -> nu, but M0 approximation is good enough
-        nu = M0  # Use current mean anomaly as position
+        nu = M0  # Use current mean anomaly as position (valid for circular orbits)
         pos_eci = OrbitalMechanics.kepler_to_cartesian(a, e, i, Omega, omega, nu)
         x, y, z = pos_eci
         
-        # Convert to ground position (no time offset for current position)
+        # Convert to ground position with Earth rotation matching the ground track
+        # The ground track starts at nu=0 (t=0), so at nu=M0 the elapsed time is (M0/2pi)*T
+        time_from_track_start = (M0 / (2 * np.pi)) * T
+        earth_rotation_sat = earth_rotation_rate * time_from_track_start
+        
         r_xy = np.sqrt(x**2 + y**2)
         lon_eci = np.arctan2(y, x)
-        lon = (lon_eci * 180 / np.pi) % 360
+        lon_ground = lon_eci - earth_rotation_sat
+        lon = (lon_ground * 180 / np.pi) % 360
         if lon > 180:
             lon -= 360
         lat = np.arctan2(z, r_xy) * 180 / np.pi
         
         ax.plot(lon, lat, 'ro', markersize=6, label='Satellite', zorder=6)
     
+    def init_3d_scene(self):
+        """Initialize static 3D elements (Earth sphere + axis arrows). Called once."""
+        self.draw_earth_pyvista()
+        
+        # Draw XYZ axis arrows on the sphere (static, never change)
+        R = OrbitalMechanics.EARTH_RADIUS / 1e6
+        arrow_len = R * 0.6
+        tip_r = 0.15
+        shaft_r = 0.03
+        tip_len = 0.3
+        
+        # X axis (Greenwich meridian on equator) - Red
+        x_arrow = pv.Arrow(start=(R, 0, 0), direction=(1, 0, 0),
+                          scale=arrow_len, tip_radius=tip_r, shaft_radius=shaft_r, tip_length=tip_len)
+        self.plotter.add_mesh(x_arrow, color='red', opacity=0.9, name='axis_x')
+        self.plotter.add_point_labels(
+            np.array([[R + arrow_len * 1.1, 0, 0]]), ['X (0°lon)'],
+            font_size=10, text_color='red', shape=None, render_points_as_spheres=False,
+            point_size=0, always_visible=True, name='axis_x_label')
+        
+        # Y axis (90°E on equator) - Green
+        y_arrow = pv.Arrow(start=(0, R, 0), direction=(0, 1, 0),
+                          scale=arrow_len, tip_radius=tip_r, shaft_radius=shaft_r, tip_length=tip_len)
+        self.plotter.add_mesh(y_arrow, color='lime', opacity=0.9, name='axis_y')
+        self.plotter.add_point_labels(
+            np.array([[0, R + arrow_len * 1.1, 0]]), ['Y (90°E)'],
+            font_size=10, text_color='lime', shape=None, render_points_as_spheres=False,
+            point_size=0, always_visible=True, name='axis_y_label')
+        
+        # Z axis (North Pole) - Blue
+        z_arrow = pv.Arrow(start=(0, 0, R), direction=(0, 0, 1),
+                          scale=arrow_len, tip_radius=tip_r, shaft_radius=shaft_r, tip_length=tip_len)
+        self.plotter.add_mesh(z_arrow, color='dodgerblue', opacity=0.9, name='axis_z')
+        self.plotter.add_point_labels(
+            np.array([[0, 0, R + arrow_len * 1.1]]), ['Z (North)'],
+            font_size=10, text_color='dodgerblue', shape=None, render_points_as_spheres=False,
+            point_size=0, always_visible=True, name='axis_z_label')
+        
+        self.plotter.reset_camera()
+        self.plotter.render()
+    
+    def _deferred_3d_update(self):
+        """Called by debounce timer to update 3D after slider stops moving."""
+        self.update_3d_plot()
+    
     def update_3d_plot(self, full_render=True):
-        """Update 3D orbit visualization with PyVista for better performance"""
-        self.plotter.clear()
+        """Update 3D orbit visualization — only dynamic elements (orbit, satellite, user, LOS).
+        Static elements (Earth, axes) are drawn once in init_3d_scene()."""
         
         # Get orbital parameters in radians
         a = self.params['a']
@@ -869,22 +1052,19 @@ class OrbitMapGUI(QMainWindow):
         omega = np.radians(self.params['omega'])
         M0 = np.radians(self.params['M0'])
         
-        # Generate orbit
-        orbit = OrbitalMechanics.generate_orbit(a, e, i, Omega, omega, M0, 1000)
+        # Generate orbit (use named actor to auto-replace previous)
+        orbit = OrbitalMechanics.generate_orbit(a, e, i, Omega, omega, M0, 200)
         orbit_scaled = orbit / 1e6
-        
-        # Draw Earth sphere
-        self.draw_earth_pyvista()
-        
-        # Create orbit line
+        n_pts = len(orbit_scaled)
         orbit_polyline = pv.PolyData(orbit_scaled)
-        orbit_polyline.lines = np.hstack([[len(orbit_scaled)] + list(range(len(orbit_scaled)))])
-        self.plotter.add_mesh(orbit_polyline, color='red', line_width=3, label='Orbit')
+        orbit_polyline.lines = np.hstack([[n_pts] + list(range(n_pts))])
+        self.plotter.add_mesh(orbit_polyline, color='red', line_width=3, name='orbit',
+                             render_lines_as_tubes=False, reset_camera=False)
         
-        # Plot current satellite position
+        # Plot current satellite position (named actor replaces previous)
         sat_pos = OrbitalMechanics.kepler_to_cartesian(a, e, i, Omega, omega, M0)
-        sat_sphere = pv.Sphere(radius=0.3, center=sat_pos / 1e6)
-        self.plotter.add_mesh(sat_sphere, color='yellow', label='Satellite')
+        sat_sphere = pv.Sphere(radius=0.3, center=sat_pos / 1e6, theta_resolution=8, phi_resolution=8)
+        self.plotter.add_mesh(sat_sphere, color='yellow', name='satellite', reset_camera=False)
         
         # Add user location
         user_lat = np.radians(self.user_location['lat'])
@@ -896,31 +1076,31 @@ class OrbitMapGUI(QMainWindow):
         user_y = user_r * np.cos(user_lat) * np.sin(user_lon)
         user_z = user_r * np.sin(user_lat)
         
-        user_sphere = pv.Sphere(radius=0.15, center=[user_x, user_y, user_z])
-        self.plotter.add_mesh(user_sphere, color='green', label='User Location')
+        user_sphere = pv.Sphere(radius=0.15, center=[user_x, user_y, user_z],
+                               theta_resolution=8, phi_resolution=8)
+        self.plotter.add_mesh(user_sphere, color='green', name='user', reset_camera=False)
         
         # Calculate line of sight and elevation
         sat_pos_3d = sat_pos / 1e6
         user_pos_3d = np.array([user_x, user_y, user_z])
-        
-        # Vector from user to satellite
         to_sat = sat_pos_3d - user_pos_3d
-        
-        # User's local up vector (from Earth center to user)
         local_up = user_pos_3d / np.linalg.norm(user_pos_3d)
-        
-        # Calculate elevation angle (angle between line of sight and local horizontal)
         to_sat_norm = to_sat / np.linalg.norm(to_sat)
         elevation_angle = np.arcsin(np.dot(to_sat_norm, local_up))
         elevation_deg = np.degrees(elevation_angle)
         
-        # If satellite is visible (elevation > 0), draw blue line of sight
+        # If satellite is visible (elevation > 0), draw line of sight
         if elevation_deg > 0:
             los_line = pv.Line(user_pos_3d, sat_pos_3d)
-            self.plotter.add_mesh(los_line, color='cyan', line_width=2, label=f'Line of Sight (El: {elevation_deg:.1f}°)')
+            self.plotter.add_mesh(los_line, color='cyan', line_width=2, name='los_line',
+                                 reset_camera=False)
+        else:
+            # Remove LOS line if satellite not visible
+            try:
+                self.plotter.remove_actor('los_line')
+            except Exception:
+                pass
         
-        # Reset camera
-        self.plotter.reset_camera()
         self.plotter.render()
     
     def update_link_plots(self, update_only_current_position=False):
@@ -940,14 +1120,15 @@ class OrbitMapGUI(QMainWindow):
             dopplers = cached_data['dopplers']
             cache_M0 = cached_data['cache_M0']
             T = cached_data['orbital_period']
+            peak_time_offset = cached_data.get('peak_time_offset', 0)
             
             # Calculate current time offset relative to when cache was built
-            # times[] are in minutes relative to t=0 at cache-build time
+            # times[] are in minutes with t=0 at peak elevation
             M0 = np.radians(self.params['M0'])
             
             # Find how far M0 has advanced since cache was built
             M_diff = (M0 - cache_M0 + np.pi) % (2 * np.pi) - np.pi  # Normalized difference
-            current_time_offset = (M_diff / (2 * np.pi)) * T / 60  # Convert to minutes
+            current_time_offset = (M_diff / (2 * np.pi)) * T / 60 - peak_time_offset  # Convert to minutes, shift to peak-centered
             
             # Check if current time is still within the cached pass window (with 5 minute margin)
             if current_time_offset < min(times) - 5 or current_time_offset > max(times) + 5:
@@ -1052,8 +1233,8 @@ class OrbitMapGUI(QMainWindow):
                                 -np.sin(user_lat) * np.sin(user_lon), 
                                 np.cos(user_lat)])
         
-        # Transmit frequency for Doppler calculation (assume 2.4 GHz)
-        f_tx = 2.4e9  # Hz
+        # Transmit frequency for Doppler calculation
+        f_tx = self.carrier_freq * 1e9  # Convert GHz to Hz
         c = 299792458  # speed of light m/s
         
         # First pass: find all elevation values to identify contact windows
@@ -1154,14 +1335,19 @@ class OrbitMapGUI(QMainWindow):
                 # Polar sky plot with line trajectory
                 zenith_angles = [90 - el for el in elevations]
                 
+                # Shift times so t=0 is at peak elevation
+                peak_idx = np.argmax(elevations)
+                peak_time_offset = times[peak_idx]  # minutes
+                times = [t - peak_time_offset for t in times]
+                
                 # Plot satellite trajectory as both line and points for better visibility
                 ax1.plot(azimuths, zenith_angles, 'b-', linewidth=3, alpha=0.8, label='Trajectory')
                 ax1.scatter(azimuths, zenith_angles, c='blue', s=20, alpha=0.5, zorder=3)
                 
-                # Mark current position with red dot (use closest time to t=0)
+                # Mark current position with red dot (use closest time to t=0 before shift)
                 if current_idx is None and len(times) > 0:
-                    # Find the closest point to t=0
-                    current_idx = np.argmin(np.abs(np.array(times)))
+                    # Find the closest point to current satellite time
+                    current_idx = np.argmin(np.abs(np.array(times) + peak_time_offset))
                 
                 # Store artist references for efficient animation updates
                 polar_marker = None
@@ -1174,7 +1360,7 @@ class OrbitMapGUI(QMainWindow):
                     polar_marker_line, = ax1.plot(current_azimuth, current_zenith, 'ro', markersize=12, 
                             markeredgecolor='black', markeredgewidth=2, label='Current', zorder=5)
                     polar_marker = polar_marker_line
-                ax1.legend(loc='lower right', fontsize=7, framealpha=0.8, markerscale=0.6)
+                ax1.legend(loc='upper left', bbox_to_anchor=(1.05, 1), fontsize=7, framealpha=0.8, markerscale=0.6, borderaxespad=0)
                 
                 # Elevation vs time plot with Doppler overlaid
                 ax2.plot(times, elevations, 'b-', linewidth=2.5, label='Elevation')
@@ -1220,7 +1406,8 @@ class OrbitMapGUI(QMainWindow):
                     'zenith_angles': zenith_angles,
                     'dopplers': dopplers,
                     'cache_M0': M0,
-                    'orbital_period': T
+                    'orbital_period': T,
+                    'peak_time_offset': peak_time_offset
                 }
                 
                 # Store artist references for efficient animation
@@ -1243,7 +1430,6 @@ class OrbitMapGUI(QMainWindow):
                          theta_resolution=360, phi_resolution=180)
         
         if self.earth_texture is not None:
-            print("Mapping texture to sphere for PyVista (one-time)...")
             # Generate texture coordinates manually
             # Compute theta (longitude) and phi (latitude) for each point
             points = sphere.points
@@ -1264,10 +1450,9 @@ class OrbitMapGUI(QMainWindow):
             
             # Create texture from image
             texture = pv.numpy_to_texture(self.earth_texture)
-            self.plotter.add_mesh(sphere, texture=texture, smooth_shading=True)
-            print("Texture mapping complete.")
+            self.plotter.add_mesh(sphere, texture=texture, smooth_shading=True, name='earth')
         else:
-            self.plotter.add_mesh(sphere, color='blue', smooth_shading=True)
+            self.plotter.add_mesh(sphere, color='blue', smooth_shading=True, name='earth')
 
 
 def main():
