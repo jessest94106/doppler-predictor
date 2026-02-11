@@ -186,8 +186,10 @@ class OrbitMapGUI(QMainWindow):
         # Debounce timer for 3D updates (slider dragging causes many rapid calls)
         self._3d_update_timer = QTimer()
         self._3d_update_timer.setSingleShot(True)
-        self._3d_update_timer.setInterval(10)  # 50ms debounce
+        self._3d_update_timer.setInterval(100)  # 100ms debounce for responsiveness on Windows
         self._3d_update_timer.timeout.connect(self._deferred_3d_update)
+        # Flag to indicate a slider is actively being dragged
+        self._slider_dragging = False
         
     def load_earth_texture(self):
         """Load Earth texture image from NASA Blue Marble"""
@@ -433,6 +435,9 @@ class OrbitMapGUI(QMainWindow):
             slider.setTickPosition(QSlider.TicksBelow)
             slider.setTickInterval(int((max_val - min_val) * 100 / 10))
             slider.valueChanged.connect(self.on_param_changed)
+            # Track dragging start/end to avoid heavy per-update work
+            slider.sliderPressed.connect(self._on_slider_pressed)
+            slider.sliderReleased.connect(self._on_slider_released)
             
             self.param_sliders[param] = slider
             
@@ -535,7 +540,15 @@ class OrbitMapGUI(QMainWindow):
             else:
                 self.params[param] = value
         
-        # Update 2D and link plots immediately (fast)
+        # If a slider is being dragged, avoid heavy recalculations on every event.
+        if getattr(self, '_slider_dragging', False):
+            # Quick visual feedback for slider movement
+            self.update_2d_plot()
+            # Defer heavier updates (3D + full link plots) to debounce timer
+            self._3d_update_timer.start()
+            return
+
+        # Full update when not actively dragging
         self.update_2d_plot()
         self.update_link_plots(update_only_current_position=False)
         # Update 3D directly (fast now — no Earth/axes rebuild)
@@ -1048,8 +1061,22 @@ class OrbitMapGUI(QMainWindow):
         self.plotter.render()
     
     def _deferred_3d_update(self):
-        """Called by debounce timer to update 3D after slider stops moving."""
+        """Called by debounce timer to update 3D and link plots after slider activity."""
+        # Run the heavier updates after a short debounce to avoid UI lag during slider dragging
         self.update_3d_plot()
+        self.update_link_plots(update_only_current_position=False)
+
+    def _on_slider_pressed(self):
+        """Called when a slider drag starts."""
+        self._slider_dragging = True
+
+    def _on_slider_released(self):
+        """Called when a slider drag ends — do a final full update."""
+        self._slider_dragging = False
+        # Stop any pending debounce and do a full update immediately
+        if hasattr(self, '_3d_update_timer') and self._3d_update_timer.isActive():
+            self._3d_update_timer.stop()
+        self.update_plots()
     
     def update_3d_plot(self, full_render=True):
         """Update 3D orbit visualization — only dynamic elements (orbit, satellite, user, LOS).
