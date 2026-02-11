@@ -17,6 +17,24 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QTimer, QDateTime
 from PyQt5.QtGui import QFont, QValidator, QDoubleValidator
+
+# Optional Numba acceleration (best-effort; falls back cleanly if unavailable)
+try:
+    import numba
+    from numba import njit, prange
+    NUMBA_AVAILABLE = True
+except Exception:
+    NUMBA_AVAILABLE = False
+    # Fallback decorator and prange alias so code can call the same symbols when numba is absent
+    def njit(func=None, **kwargs):
+        def decorator(f):
+            return f
+        if func is None:
+            return decorator
+        else:
+            return func
+    prange = range
+
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
@@ -88,19 +106,11 @@ class OrbitalMechanics:
     def generate_orbit(a, e, i, Omega, omega, M0, num_points=200):
         """
         Generate orbit points around Earth (vectorized).
-        
-        Args:
-            a: Semi-major axis (m)
-            e: Eccentricity
-            i: Inclination (radians)
-            Omega: RAAN (radians)
-            omega: Argument of Perigee (radians)
-            M0: Mean anomaly (radians)
-            num_points: Number of points to generate
-        
-        Returns:
-            Array of shape (num_points, 3) with [x, y, z] coordinates
+        Uses a Numba-accelerated implementation when available for heavy workloads.
         """
+        if NUMBA_AVAILABLE:
+            return _generate_orbit_numba(a, e, i, Omega, omega, num_points)
+
         nu = np.linspace(0, 2 * np.pi, num_points, endpoint=False)
         
         # Distance from focus (vectorized)
@@ -126,6 +136,79 @@ class OrbitalMechanics:
         z = sin_i * sin_w * x_peri + sin_i * cos_w * y_peri
         
         return np.column_stack([x, y, z])
+
+
+# -- Numba-accelerated helpers (optional) ---------------------------------
+if NUMBA_AVAILABLE:
+    @njit
+    def _kepler_to_cartesian_numba(a, e, i, Omega, omega, nu):
+        r = a * (1.0 - e * e) / (1.0 + e * np.cos(nu))
+        x_peri = r * np.cos(nu)
+        y_peri = r * np.sin(nu)
+        cos_O = np.cos(Omega)
+        sin_O = np.sin(Omega)
+        cos_w = np.cos(omega)
+        sin_w = np.sin(omega)
+        cos_i = np.cos(i)
+        sin_i = np.sin(i)
+        x = (cos_O * cos_w - sin_O * sin_w * cos_i) * x_peri + (-cos_O * sin_w - sin_O * cos_w * cos_i) * y_peri
+        y = (sin_O * cos_w + cos_O * sin_w * cos_i) * x_peri + (-sin_O * sin_w + cos_O * cos_w * cos_i) * y_peri
+        z = sin_i * sin_w * x_peri + sin_i * cos_w * y_peri
+        out = np.empty(3)
+        out[0] = x
+        out[1] = y
+        out[2] = z
+        return out
+
+    @njit(parallel=True)
+    def _generate_orbit_numba(a, e, i, Omega, omega, num_points):
+        arr = np.empty((num_points, 3))
+        two_pi = 2.0 * np.pi
+        for j in prange(num_points):
+            nu = j * two_pi / num_points
+            arr[j, :] = _kepler_to_cartesian_numba(a, e, i, Omega, omega, nu)
+        return arr
+
+    @njit(parallel=True)
+    def _compute_elevations_numba(a, e, i, Omega, omega, M0, user_pos, time_points_search, T):
+        n = time_points_search.shape[0]
+        out = np.empty(n)
+        user_norm = np.sqrt(user_pos[0]*user_pos[0] + user_pos[1]*user_pos[1] + user_pos[2]*user_pos[2])
+        lu0 = user_pos[0]/user_norm; lu1 = user_pos[1]/user_norm; lu2 = user_pos[2]/user_norm
+        two_pi = 2.0 * np.pi
+        for idx in prange(n):
+            t = time_points_search[idx]
+            M = M0 + (t / T) * two_pi
+            pos = _kepler_to_cartesian_numba(a, e, i, Omega, omega, M)
+            to0 = pos[0] - user_pos[0]; to1 = pos[1] - user_pos[1]; to2 = pos[2] - user_pos[2]
+            dist = np.sqrt(to0*to0 + to1*to1 + to2*to2)
+            to0 /= dist; to1 /= dist; to2 /= dist
+            dot = to0*lu0 + to1*lu1 + to2*lu2
+            if dot > 1.0:
+                dot = 1.0
+            elif dot < -1.0:
+                dot = -1.0
+            out[idx] = np.degrees(np.arcsin(dot))
+        return out
+else:
+    # Fallback Python implementations (invoked when Numba is unavailable)
+    def _generate_orbit_numba(a, e, i, Omega, omega, num_points):
+        return OrbitalMechanics.generate_orbit(a, e, i, Omega, omega, 0, num_points)
+
+    def _compute_elevations_numba(a, e, i, Omega, omega, M0, user_pos, time_points_search, T):
+        out = np.empty(time_points_search.shape[0])
+        for idx, t in enumerate(time_points_search):
+            M = M0 + (t / T) * 2.0 * np.pi
+            pos = OrbitalMechanics.kepler_to_cartesian(a, e, i, Omega, omega, M)
+            to = pos - user_pos
+            dist = np.linalg.norm(to)
+            if dist == 0:
+                out[idx] = 0.0
+                continue
+            to_norm = to / dist
+            lu = user_pos / np.linalg.norm(user_pos)
+            elevation_angle = np.arcsin(np.dot(to_norm, lu))
+            out[idx] = np.degrees(elevation_angle)
 
 
 class OrbitMapGUI(QMainWindow):
@@ -174,15 +257,7 @@ class OrbitMapGUI(QMainWindow):
         
         # 3D scene: track dynamic label actors for manual removal
         self._3d_label_actors = []
-        
-        # Create UI
-        self.init_ui()
-        
-        # Setup simulation timer
-        self.sim_timer = QTimer()
-        self.sim_timer.timeout.connect(self.update_simulation)
-        self.sim_timer.setInterval(10)  # Fast interval for responsive pause
-        
+
         # Debounce timer for 3D updates (slider dragging causes many rapid calls)
         self._3d_update_timer = QTimer()
         self._3d_update_timer.setSingleShot(True)
@@ -190,6 +265,20 @@ class OrbitMapGUI(QMainWindow):
         self._3d_update_timer.timeout.connect(self._deferred_3d_update)
         # Flag to indicate a slider is actively being dragged
         self._slider_dragging = False
+        # Orbit detail levels (points) for interactive vs full rendering
+        self._orbit_detail_full = 200
+        self._orbit_detail_low = 36
+        # Throttle for fast updates (seconds)
+        self._fast_update_throttle = 0.05
+        self._last_fast_update_time = 0.0
+
+        # Create UI
+        self.init_ui()
+        
+        # Setup simulation timer
+        self.sim_timer = QTimer()
+        self.sim_timer.timeout.connect(self.update_simulation)
+        self.sim_timer.setInterval(10)  # Fast interval for responsive pause
         
     def load_earth_texture(self):
         """Load Earth texture image from NASA Blue Marble"""
@@ -322,6 +411,10 @@ class OrbitMapGUI(QMainWindow):
         
         # Draw initial plots
         self.update_plots()
+
+        # Precompile Numba-accelerated functions in background to avoid first-call lag
+        if NUMBA_AVAILABLE:
+            QTimer.singleShot(100, self._precompile_numba)
         
         main_layout.addLayout(top_layout, 2)
         main_layout.addLayout(bottom_layout, 1)
@@ -544,15 +637,17 @@ class OrbitMapGUI(QMainWindow):
         if getattr(self, '_slider_dragging', False):
             # Quick visual feedback for slider movement
             self.update_2d_plot()
-            # Defer heavier updates (3D + full link plots) to debounce timer
+            # Do a low-detail 3D update immediately for responsiveness
+            self.update_3d_plot(num_points=self._orbit_detail_low, full_render=False)
+            # Defer heavier updates (full 3D + link plots) to debounce timer
             self._3d_update_timer.start()
             return
 
         # Full update when not actively dragging
         self.update_2d_plot()
         self.update_link_plots(update_only_current_position=False)
-        # Update 3D directly (fast now — no Earth/axes rebuild)
-        self.update_3d_plot()
+        # Update 3D directly (full detail)
+        self.update_3d_plot(num_points=self._orbit_detail_full, full_render=True)
     
     def on_location_changed(self):
         """Handle location changes"""
@@ -1077,11 +1172,39 @@ class OrbitMapGUI(QMainWindow):
         if hasattr(self, '_3d_update_timer') and self._3d_update_timer.isActive():
             self._3d_update_timer.stop()
         self.update_plots()
+
+    def _precompile_numba(self):
+        """Warm up Numba-compiled functions to avoid visible lag on first use."""
+        try:
+            print("Precompiling Numba functions (this may take a moment)...")
+            a = self.params['a']
+            e = self.params['e']
+            i = np.radians(self.params['i'])
+            Omega = np.radians(self.params['Omega'])
+            omega = np.radians(self.params['omega'])
+            # small orbit to compile orbit generator
+            _generate_orbit_numba(a, e, i, Omega, omega, 8)
+            # small search to compile elevation kernel
+            mu = 3.986004418e14
+            T = 2 * np.pi * np.sqrt(a**3 / mu)
+            times = np.linspace(-T, T, 64)
+            user_r = OrbitalMechanics.EARTH_RADIUS + self.user_location['alt']
+            user_lat = np.radians(self.user_location['lat'])
+            user_lon = np.radians(self.user_location['lon'])
+            user_pos = np.array([user_r * np.cos(user_lat) * np.cos(user_lon),
+                                 user_r * np.cos(user_lat) * np.sin(user_lon),
+                                 user_r * np.sin(user_lat)])
+            _compute_elevations_numba(a, e, i, Omega, omega, np.radians(self.params['M0']), user_pos, times, T)
+            print("Numba precompile finished.")
+        except Exception as exc:
+            print("Numba precompile failed:", exc)
     
-    def update_3d_plot(self, full_render=True):
+    def update_3d_plot(self, num_points=None, full_render=True):
         """Update 3D orbit visualization — only dynamic elements (orbit, satellite, user, LOS).
+        If num_points is provided, use that resolution for the orbit; this allows fast low-detail
+        updates while dragging sliders.
         Static elements (Earth, axes) are drawn once in init_3d_scene()."""
-        
+        import time
         # Get orbital parameters in radians
         a = self.params['a']
         e = self.params['e']
@@ -1089,35 +1212,40 @@ class OrbitMapGUI(QMainWindow):
         Omega = np.radians(self.params['Omega'])
         omega = np.radians(self.params['omega'])
         M0 = np.radians(self.params['M0'])
-        
+
+        # Choose number of points for this update
+        if num_points is None:
+            num_points = self._orbit_detail_full
+
         # Generate orbit (use named actor to auto-replace previous)
-        orbit = OrbitalMechanics.generate_orbit(a, e, i, Omega, omega, M0, 200)
+        orbit = OrbitalMechanics.generate_orbit(a, e, i, Omega, omega, M0, num_points)
         orbit_scaled = orbit / 1e6
         n_pts = len(orbit_scaled)
         orbit_polyline = pv.PolyData(orbit_scaled)
         orbit_polyline.lines = np.hstack([[n_pts] + list(range(n_pts))])
         self.plotter.add_mesh(orbit_polyline, color='red', line_width=3, name='orbit',
                              render_lines_as_tubes=False, reset_camera=False)
-        
+
         # Plot current satellite position (named actor replaces previous)
         sat_pos = OrbitalMechanics.kepler_to_cartesian(a, e, i, Omega, omega, M0)
-        sat_sphere = pv.Sphere(radius=0.3, center=sat_pos / 1e6, theta_resolution=8, phi_resolution=8)
+        sat_sphere = pv.Sphere(radius=0.3 if full_render else 0.22, center=sat_pos / 1e6,
+                               theta_resolution=8, phi_resolution=8)
         self.plotter.add_mesh(sat_sphere, color='yellow', name='satellite', reset_camera=False)
-        
-        # Add user location
+
+        # Add user location (keep small sphere)
         user_lat = np.radians(self.user_location['lat'])
         user_lon = np.radians(self.user_location['lon'])
         user_alt = self.user_location['alt']
-        
+
         user_r = (OrbitalMechanics.EARTH_RADIUS + user_alt) / 1e6
         user_x = user_r * np.cos(user_lat) * np.cos(user_lon)
         user_y = user_r * np.cos(user_lat) * np.sin(user_lon)
         user_z = user_r * np.sin(user_lat)
-        
+
         user_sphere = pv.Sphere(radius=0.15, center=[user_x, user_y, user_z],
                                theta_resolution=8, phi_resolution=8)
         self.plotter.add_mesh(user_sphere, color='green', name='user', reset_camera=False)
-        
+
         # Calculate line of sight and elevation
         sat_pos_3d = sat_pos / 1e6
         user_pos_3d = np.array([user_x, user_y, user_z])
@@ -1126,7 +1254,7 @@ class OrbitMapGUI(QMainWindow):
         to_sat_norm = to_sat / np.linalg.norm(to_sat)
         elevation_angle = np.arcsin(np.dot(to_sat_norm, local_up))
         elevation_deg = np.degrees(elevation_angle)
-        
+
         # If satellite is visible (elevation > 0), draw line of sight
         if elevation_deg > 0:
             los_line = pv.Line(user_pos_3d, sat_pos_3d)
@@ -1138,8 +1266,16 @@ class OrbitMapGUI(QMainWindow):
                 self.plotter.remove_actor('los_line')
             except Exception:
                 pass
-        
-        self.plotter.render()
+
+        # For fast updates, throttle render calls to avoid saturating UI
+        now = time.time()
+        # If low-detail (interactive), only render at most once per throttle window
+        if num_points <= self._orbit_detail_low:
+            if now - self._last_fast_update_time > self._fast_update_throttle:
+                self.plotter.render()
+                self._last_fast_update_time = now
+        else:
+            self.plotter.render()
     
     def update_link_plots(self, update_only_current_position=False):
         """Update polar sky view and elevation angle plots
@@ -1276,18 +1412,22 @@ class OrbitMapGUI(QMainWindow):
         c = 299792458  # speed of light m/s
         
         # First pass: find all elevation values to identify contact windows
-        all_elevations = []
-        for t in time_points_search:
-            M = M0 + (t / T) * 2 * np.pi
-            nu = M
-            pos_sat = OrbitalMechanics.kepler_to_cartesian(a, e, i, Omega, omega, nu)
-            to_sat = pos_sat - user_pos
-            to_sat_norm = to_sat / np.linalg.norm(to_sat)
-            elevation_angle = np.arcsin(np.dot(to_sat_norm, local_up))
-            elevation_deg = np.degrees(elevation_angle)
-            all_elevations.append(elevation_deg)
-        
-        all_elevations = np.array(all_elevations)
+        # Use Numba-accelerated routine when available to speedup large searches
+        if NUMBA_AVAILABLE:
+            # time_points_search is already a NumPy array
+            all_elevations = _compute_elevations_numba(a, e, i, Omega, omega, M0, user_pos, time_points_search, T)
+        else:
+            all_elevations = []
+            for t in time_points_search:
+                M = M0 + (t / T) * 2 * np.pi
+                nu = M
+                pos_sat = OrbitalMechanics.kepler_to_cartesian(a, e, i, Omega, omega, nu)
+                to_sat = pos_sat - user_pos
+                to_sat_norm = to_sat / np.linalg.norm(to_sat)
+                elevation_angle = np.arcsin(np.dot(to_sat_norm, local_up))
+                elevation_deg = np.degrees(elevation_angle)
+                all_elevations.append(elevation_deg)
+            all_elevations = np.array(all_elevations)
         
         # Check if satellite is currently in contact (at t=0)
         current_time_idx = len(time_points_search) // 2  # t=0 is at the middle
