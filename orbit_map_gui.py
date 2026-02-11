@@ -13,7 +13,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QSlider, QPushButton, QTabWidget, QGroupBox,
     QFormLayout, QCheckBox, QSpinBox, QDoubleSpinBox, QDateTimeEdit,
-    QGridLayout
+    QGridLayout, QSizePolicy
 )
 from PyQt5.QtCore import Qt, QTimer, QDateTime
 from PyQt5.QtGui import QFont, QValidator, QDoubleValidator
@@ -259,6 +259,8 @@ class OrbitMapGUI(QMainWindow):
         
         # Overall layout: top row (controls + 3D) and bottom row (2D map + link plots)
         main_layout = QVBoxLayout()
+        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(8, 8, 8, 8)
         
         # === Top row: Controls on left, 3D view on right ===
         top_layout = QHBoxLayout()
@@ -371,13 +373,15 @@ class OrbitMapGUI(QMainWindow):
         layout.addLayout(step_layout)
         
         group.setLayout(layout)
-        group.setMaximumHeight(180)
         return group
     
     def create_parameter_group(self):
         """Create orbital parameters input group"""
         group = QGroupBox("Orbital Parameters")
         layout = QGridLayout()
+        layout.setHorizontalSpacing(8)
+        layout.setVerticalSpacing(6)
+        layout.setContentsMargins(6, 6, 6, 6)
         layout.setColumnStretch(0, 0)  # Label - fixed width
         layout.setColumnStretch(1, 0)  # Input box - fixed width
         layout.setColumnStretch(2, 1)  # Slider - takes all remaining space
@@ -414,7 +418,9 @@ class OrbitMapGUI(QMainWindow):
             input_box.setSingleStep(step)
             input_box.setValue(default)
             input_box.setDecimals(2 if param == 'e' else 0)
-            input_box.setFixedWidth(70)
+            # Use minimum width + flexible size policy so the widget adapts to platform font/DPI
+            input_box.setMinimumWidth(90)
+            input_box.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
             input_box.valueChanged.connect(self.on_param_changed)
             
             self.param_inputs[param] = input_box
@@ -442,6 +448,9 @@ class OrbitMapGUI(QMainWindow):
         """Create user location input group"""
         group = QGroupBox("User Location")
         layout = QGridLayout()
+        layout.setHorizontalSpacing(8)
+        layout.setVerticalSpacing(6)
+        layout.setContentsMargins(6, 6, 6, 6)
         
         # Row 0: Latitude | Longitude
         self.lat_input = QDoubleSpinBox()
@@ -451,6 +460,7 @@ class OrbitMapGUI(QMainWindow):
         self.lat_input.setDecimals(4)
         self.lat_input.setSingleStep(0.1)
         self.lat_input.valueChanged.connect(self.on_location_changed)
+        self.lat_input.setMinimumWidth(100)
         layout.addWidget(QLabel("Lat (°)"), 0, 0)
         layout.addWidget(self.lat_input, 0, 1)
         
@@ -461,6 +471,7 @@ class OrbitMapGUI(QMainWindow):
         self.lon_input.setDecimals(4)
         self.lon_input.setSingleStep(0.1)
         self.lon_input.valueChanged.connect(self.on_location_changed)
+        self.lon_input.setMinimumWidth(100)
         layout.addWidget(QLabel("Lon (°)"), 0, 2)
         layout.addWidget(self.lon_input, 0, 3)
         
@@ -1457,7 +1468,14 @@ class OrbitMapGUI(QMainWindow):
 
 def main():
     """Main entry point"""
+    # Enable high-DPI scaling on Windows to avoid cramped widgets and overlapping text
+    if sys.platform.startswith('win'):
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
+    # Set a reasonable default font on Windows
+    if sys.platform.startswith('win'):
+        app.setFont(QFont('Segoe UI', 9))
     window = OrbitMapGUI()
     window.show()
     sys.exit(app.exec_())
